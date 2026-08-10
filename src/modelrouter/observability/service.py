@@ -30,18 +30,27 @@ coherent tree, not 6 unrelated top-level requests.
 docstring already names: `get_trace`/`get_trace_tree`/`list_traces` replay
 the WHOLE `"observability"` stream on every call — the simplest thing that's
 correct, not the fastest. A cached/materialized projector is the natural
-next step once event volume makes a full replay too slow."""
+next step once event volume makes a full replay too slow.
+
+**`publisher` (optional — see `async_publish.py`).** `None` (the default)
+makes `record()` byte-identical to before this parameter existed — same
+opt-in-upgrade convention as everything else in this codebase. When set,
+`record()` still appends to `EventStore` first and unconditionally; the
+publish is a best-effort side channel afterward, never a gate on whether
+the trace is considered recorded."""
 
 from __future__ import annotations
 
 from modelrouter.observability.events import OBSERVABILITY_STREAM, TRACE_RECORDED
+from modelrouter.observability.async_publish import TracePublisher
 from modelrouter.observability.models import Trace
 from modelrouter.store.events import Event, EventStore
 
 
 class TraceService:
-    def __init__(self, store: EventStore):
+    def __init__(self, store: EventStore, *, publisher: TracePublisher | None = None):
         self._store = store
+        self._publisher = publisher
 
     # ── Write ────────────────────────────────────────────────────────────
 
@@ -53,13 +62,26 @@ class TraceService:
         tags: dict[str, str] | None = None,
         prompt_version: str | None = None, policy_version: str | None = None,
     ) -> None:
-        self._store.append(OBSERVABILITY_STREAM, TRACE_RECORDED, {
+        data = {
             "request_id": request_id, "tenant_id": tenant_id, "parent_request_id": parent_request_id,
             "requested_model": requested_model, "served_by": served_by, "attempt": attempt,
             "cost_usd": cost_usd, "duration_s": duration_s, "verdict": verdict,
             "pipeline": pipeline or [], "attempts": attempts or [], "tags": tags or {},
             "prompt_version": prompt_version, "policy_version": policy_version,
-        })
+        }
+        self._store.append(OBSERVABILITY_STREAM, TRACE_RECORDED, data)
+        if self._publisher is not None:
+            try:
+                self._publisher.publish(TRACE_RECORDED, data)
+            except Exception:
+                # Defense in depth on top of TracePublisher's own "MUST NOT
+                # raise" contract: a THIRD-PARTY publisher that doesn't hold
+                # up its end must still never turn a durable write that
+                # already succeeded into a caller-visible failure. Same
+                # "exceptions are swallowed here on purpose; a real
+                # deployment should still log them" honesty
+                # `Broadcaster.broadcast()` already states for its own sinks.
+                pass
 
     # ── Read ─────────────────────────────────────────────────────────────
 

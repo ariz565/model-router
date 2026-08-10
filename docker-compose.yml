@@ -1,0 +1,73 @@
+# Local production-shaped infra for ModelRouter — everything docs/ARCHITECTURE-PLAN.md's
+# L0/L8/BYOK sections describe a real deployment needing, runnable on a laptop.
+#
+#   docker compose up -d
+#   pip install -e ".[all]"
+#   MODELROUTER_STORAGE=postgres MODELROUTER_POSTGRES_DSN=postgresql://modelrouter:modelrouter@localhost:5432/modelrouter \
+#     modelrouter serve
+#
+# Kafka is Redpanda here, not Apache Kafka + Zookeeper: it speaks the real
+# Kafka wire protocol (aiokafka connects to it unmodified — nothing in
+# observability/async_publish.py is Redpanda-specific), needs one container
+# instead of two, and is a genuinely common choice in real production fleets,
+# not just a local-dev shortcut. Swapping in MSK for a real AWS deployment is
+# a bootstrap-servers string change, not a code change — see infra/terraform/.
+#
+# LocalStack stands in for SQS + KMS (both used optionally — see
+# .env.example's MODELROUTER_TRACE_SQS_QUEUE_URL / MODELROUTER_BYOK_KMS_KEY_ID)
+# so the AWS-dependent paths are exercisable without a real AWS account.
+
+services:
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes: ["redis_data:/data"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  postgres:
+    image: postgres:16-alpine
+    ports: ["5432:5432"]
+    environment:
+      POSTGRES_USER: modelrouter
+      POSTGRES_PASSWORD: modelrouter
+      POSTGRES_DB: modelrouter
+    volumes: ["postgres_data:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U modelrouter"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v24.2.7
+    ports:
+      - "9092:9092"     # Kafka API -- MODELROUTER_TRACE_KAFKA_BOOTSTRAP_SERVERS
+      - "9644:9644"     # Redpanda admin/metrics
+    command:
+      - redpanda start
+      - --smp 1
+      - --memory 512M
+      - --overprovisioned
+      - --node-id 0
+      - --kafka-addr PLAINTEXT://0.0.0.0:9092
+      - --advertise-kafka-addr PLAINTEXT://localhost:9092
+    volumes: ["redpanda_data:/var/lib/redpanda/data"]
+
+  localstack:
+    image: localstack/localstack:3
+    ports: ["4566:4566"]   # every emulated AWS service, incl. SQS + KMS, on one edge port
+    environment:
+      SERVICES: sqs,kms
+      DEFAULT_REGION: us-east-1
+    volumes: ["localstack_data:/var/lib/localstack"]
+
+volumes:
+  redis_data:
+  postgres_data:
+  redpanda_data:
+  localstack_data:

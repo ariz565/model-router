@@ -33,7 +33,10 @@ from __future__ import annotations
 import time
 import uuid
 from dataclasses import asdict, replace
-from typing import AsyncIterator, Callable
+from typing import TYPE_CHECKING, AsyncIterator, Callable
+
+if TYPE_CHECKING:
+    from modelrouter.tenancy.byok import CredentialVault
 
 from modelrouter.accounting import AccountingService
 from modelrouter.observability import VERDICT_FAILED, VERDICT_OK, TraceService
@@ -220,6 +223,7 @@ class ModelRouter:
         broadcaster: Broadcaster | None = None,
         traces: TraceService | None = None,
         prompt_cache: PromptCacheTracker | None = None,
+        credential_vault: CredentialVault | None = None,
     ):
         self._adapters = adapters
         self._retry_policy = retry_policy or RetryPolicy()
@@ -241,6 +245,25 @@ class ModelRouter:
         self._traces = traces
         self._prompt_cache = prompt_cache
         self._broadcaster = broadcaster
+        self._credential_vault = credential_vault
+
+    def _resolve_adapter(self, provider_name: str, tenant_id: str | None) -> ProviderPort | None:
+        """The one seam every dispatch site below calls through instead of
+        indexing `self._adapters` directly. `None` `credential_vault`
+        (the default) or no BYOK key stored for this exact (tenant_id,
+        provider) pair makes this byte-identical to the old
+        `self._adapters.get(provider_name)` — same opt-in-upgrade
+        convention as `traces`/`prompt_cache` above. A BYOK hit builds a
+        fresh, tenant-scoped adapter instead (byok_resolver.py) rather than
+        ever handing a tenant's own key to code shared with every other
+        tenant."""
+        if self._credential_vault is not None and tenant_id is not None:
+            byok_key = self._credential_vault.resolve_key(tenant_id, provider_name)
+            if byok_key is not None:
+                from modelrouter.providers.byok_resolver import build_tenant_adapter
+
+                return build_tenant_adapter(provider_name, byok_key)
+        return self._adapters.get(provider_name)
 
     async def chat(
         self,
@@ -263,7 +286,7 @@ class ModelRouter:
         given -> identical behavior to a router with no billing at all
         (still the default for direct Python-API callers/most tests that
         don't care about billing). `server.py` itself DOES resolve a real
-        `tenant_id` on every HTTP request (`require_tenant_key()` -> L1's
+        `tenant_id` on every HTTP request (`require_principal()` -> L1's
         `TenancyRepo`, hard-cutover done — see ARCHITECTURE-PLAN.md's L1
         section) — opt-in stays the permanent design regardless, not a
         placeholder for that since-closed gap: Fusion/BodyBuilder's own
@@ -405,7 +428,7 @@ class ModelRouter:
 
         for idx, model_spec in enumerate(working_models):
             for endpoint in self._resolve_endpoints_for(model_spec, prefix_hash):
-                adapter = self._adapters.get(endpoint.provider)
+                adapter = self._resolve_adapter(endpoint.provider, tenant_id)
                 if adapter is None:
                     skipped.append(SkippedCandidate(spec=endpoint.spec, reason="unknown_provider"))
                     continue
@@ -615,7 +638,7 @@ class ModelRouter:
         try:
             for idx, model_spec in enumerate(working_models):
                 for endpoint in self._resolve_endpoints_for(model_spec, prefix_hash):
-                    adapter = self._adapters.get(endpoint.provider)
+                    adapter = self._resolve_adapter(endpoint.provider, tenant_id)
                     if adapter is None:
                         skipped.append(SkippedCandidate(spec=endpoint.spec, reason="unknown_provider"))
                         continue
@@ -769,7 +792,7 @@ class ModelRouter:
         candidates: list[tuple[str, ProviderPort, ChatRequest]] = []
         for spec in models:
             provider_name, _, model_name = spec.partition(":")
-            adapter = self._adapters.get(provider_name)
+            adapter = self._resolve_adapter(provider_name, tenant_id)
             if adapter is None:
                 skipped.append(SkippedCandidate(spec=spec, reason="unknown_provider"))
                 continue

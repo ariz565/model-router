@@ -36,6 +36,14 @@ already enforces, now on a real event log instead of a mutable float.
 (the process died between RESERVE and SETTLE) is auto-released the next
 time anyone touches that tenant's account — `_expire_stale_reservations()`
 runs before every read. No background scheduler needed.
+
+**Multi-replica hot path (opt-in — see `accounting/ledger.py`).** Everything
+above is correct for a single process; `fast_ledger`, when provided, makes
+the availability check ITSELF cross-process-atomic via Redis instead of this
+service's own `threading.Lock` (which only ever protected one process). Left
+`None` (the default), every code path below is byte-identical to before this
+parameter existed — same opt-in-upgrade convention as `ModelRouter`'s
+`traces`/`prompt_cache` params.
 """
 
 from __future__ import annotations
@@ -53,6 +61,7 @@ from modelrouter.accounting.events import (
     RESERVATION_RELEASED,
     SPEND_SETTLED,
 )
+from modelrouter.accounting.ledger import ReservationLedger
 from modelrouter.accounting.models import CreditAccount, Reservation
 from modelrouter.accounting.money import usd_to_micros
 from modelrouter.core.errors import InsufficientBudgetError, ReservationNotFoundError
@@ -62,10 +71,14 @@ DEFAULT_RESERVATION_TTL_SECONDS = 900   # 15 minutes, per the doc's own example
 
 
 class AccountingService:
-    def __init__(self, store: EventStore, *, reservation_ttl_seconds: int = DEFAULT_RESERVATION_TTL_SECONDS):
+    def __init__(
+        self, store: EventStore, *, reservation_ttl_seconds: int = DEFAULT_RESERVATION_TTL_SECONDS,
+        fast_ledger: ReservationLedger | None = None,
+    ):
         self._store = store
         self._ttl = reservation_ttl_seconds
         self._lock = threading.Lock()
+        self._fast_ledger = fast_ledger
 
     # ── Public API ────────────────────────────────────────────────────────
 
@@ -73,11 +86,14 @@ class AccountingService:
         self, tenant_id: str, amount_usd: float, *,
         currency_display: str | None = None, fx_rate: float | None = None,
     ) -> None:
+        amount_micro = usd_to_micros(amount_usd)
         with self._lock:
             self._store.append(ACCOUNTING_STREAM, CREDITS_PURCHASED, {
-                "tenant_id": tenant_id, "amount_micro_usd": usd_to_micros(amount_usd),
+                "tenant_id": tenant_id, "amount_micro_usd": amount_micro,
                 "currency_display": currency_display, "fx_rate": fx_rate,
             })
+            if self._fast_ledger is not None:
+                self._fast_ledger.sync_purchase(tenant_id, amount_micro)
 
     def balance(self, tenant_id: str) -> CreditAccount:
         with self._lock:
@@ -90,13 +106,21 @@ class AccountingService:
         partially reserves; either the full amount is held or nothing is."""
         with self._lock:
             self._expire_stale_reservations(tenant_id)
-            account = self._project(tenant_id)
             amount_micro = usd_to_micros(worst_case_cost_usd)
-            if amount_micro > account.available_micro_usd:
-                raise InsufficientBudgetError(
-                    tenant_id, requested_micro_usd=amount_micro,
-                    available_micro_usd=account.available_micro_usd,
-                )
+            if self._fast_ledger is not None:
+                if not self._fast_ledger.try_reserve(tenant_id, amount_micro):
+                    account = self._project(tenant_id)   # for the error message's real numbers only
+                    raise InsufficientBudgetError(
+                        tenant_id, requested_micro_usd=amount_micro,
+                        available_micro_usd=account.available_micro_usd,
+                    )
+            else:
+                account = self._project(tenant_id)
+                if amount_micro > account.available_micro_usd:
+                    raise InsufficientBudgetError(
+                        tenant_id, requested_micro_usd=amount_micro,
+                        available_micro_usd=account.available_micro_usd,
+                    )
             expires_at = datetime.now(timezone.utc) + timedelta(seconds=self._ttl)
             self._store.append(ACCOUNTING_STREAM, AMOUNT_RESERVED, {
                 "request_id": request_id, "tenant_id": tenant_id,
@@ -127,8 +151,11 @@ class AccountingService:
         three versions sitting on the SAME historical record, not scattered
         across separate lookups."""
         with self._lock:
-            if request_id not in self._open_reservations(tenant_id):
+            open_reservations = self._open_reservations(tenant_id)
+            if request_id not in open_reservations:
                 raise ReservationNotFoundError(request_id)
+            reserved_micro = open_reservations[request_id]["amount_micro_usd"]
+            total_micro = usd_to_micros(actual_cost_usd)
             self._store.append(ACCOUNTING_STREAM, RESERVATION_RELEASED, {
                 "request_id": request_id, "tenant_id": tenant_id, "reason": RELEASE_SETTLED,
             })
@@ -138,20 +165,27 @@ class AccountingService:
                 "completion_tokens": completion_tokens, "cached_tokens": cached_tokens,
                 "provider_cost_micro_usd": usd_to_micros(provider_cost_usd),
                 "platform_fee_micro_usd": usd_to_micros(platform_fee_usd),
-                "total_micro_usd": usd_to_micros(actual_cost_usd),
+                "total_micro_usd": total_micro,
                 "tags": tags or {}, "prompt_version": prompt_version, "policy_version": policy_version,
             })
+            if self._fast_ledger is not None:
+                self._fast_ledger.release(tenant_id, reserved_micro)
+                self._fast_ledger.record_spend(tenant_id, total_micro)
 
     def release_failed(self, tenant_id: str, request_id: str) -> None:
         """Zero-completion insurance: releases the hold, records nothing
         against `spent`. A failed attempt costs nothing, exactly as
         `CreditLedger.record_failed_attempt()` already guarantees today."""
         with self._lock:
-            if request_id not in self._open_reservations(tenant_id):
+            open_reservations = self._open_reservations(tenant_id)
+            if request_id not in open_reservations:
                 raise ReservationNotFoundError(request_id)
+            reserved_micro = open_reservations[request_id]["amount_micro_usd"]
             self._store.append(ACCOUNTING_STREAM, RESERVATION_RELEASED, {
                 "request_id": request_id, "tenant_id": tenant_id, "reason": RELEASE_FAILED,
             })
+            if self._fast_ledger is not None:
+                self._fast_ledger.release(tenant_id, reserved_micro)
 
     # ── Projection (replay-based; see module docstring) ──────────────────
 
@@ -177,6 +211,12 @@ class AccountingService:
                 self._store.append(ACCOUNTING_STREAM, RESERVATION_RELEASED, {
                     "request_id": request_id, "tenant_id": tenant_id, "reason": RELEASE_EXPIRED,
                 })
+                if self._fast_ledger is not None:
+                    # Same crash-window caveat as ledger.py's module docstring:
+                    # this releases the ledger's hold in step with the event
+                    # log's own expiry, keeping the two in sync on the ONE path
+                    # (TTL) that would otherwise silently drift apart forever.
+                    self._fast_ledger.release(tenant_id, data["amount_micro_usd"])
 
     def _project(self, tenant_id: str) -> CreditAccount:
         purchased = spent = 0

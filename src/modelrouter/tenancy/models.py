@@ -1,10 +1,11 @@
-"""L1 identity records — replaces today's `Workspace.api_keys: set[str]`
-(plaintext, O(n) scan) with real, hashed, indexed identity (see
-ARCHITECTURE-PLAN.md's L1 section). `Account`/`Workspace` (workspaces.py)
-are unchanged and still own guardrail-policy composition, BYOK keys, and
-routing defaults — this module is specifically the identity/auth piece the
-doc calls out as insecure today, not a replacement for the whole tenancy
-concept.
+"""L1 machine-identity records: hashed, indexed API keys and the `Tenant` they
+belong to (see ARCHITECTURE-PLAN.md's L1 section).
+
+`Tenant` doubles as the ORGANIZATION — `identity/`'s workspaces, projects, and
+memberships all hang off `tenant_id` rather than a parallel `organizations`
+table, because `tenant_id` is already the tenancy key threaded through
+accounting, traces, evidence, and every HTTP surface here (see
+`identity/models.py`'s docstring for the full reasoning).
 """
 
 from __future__ import annotations

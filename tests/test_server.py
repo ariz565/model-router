@@ -720,6 +720,43 @@ def test_openai_compat_json_schema_contract_is_enforced():
         assert response.status_code == 200
 
 
+def test_anthropic_compat_json_schema_contract_is_now_enforced():
+    """Regression test for a real gap: `AnthropicMessagesRequest` used to
+    have no `response_format`/`json_schema`/`contract_policy` fields at
+    all, so a Claude Code caller hitting L7 contracts got silently nothing
+    — while the exact same feature already worked on both the native and
+    OpenAI-compat surfaces (see the test right above this one). Mirrors
+    that test's own scope exactly (proof the HTTP layer wires the fields
+    through to `ChatRequest` without erroring; router-level contract
+    enforcement itself is covered exhaustively in
+    tests/test_contracts_router_wiring.py) on `/v1/messages` instead."""
+    from modelrouter import server as server_module
+    from modelrouter.providers.adapters import FakeProviderAdapter
+    from modelrouter.router import ModelRouter
+
+    with TestClient(server_module.app) as client:
+        fake = FakeProviderAdapter("anthropic", response_text='{"age": 5}')   # missing required "name"
+        server_module.app.state.router = ModelRouter({"anthropic": fake})
+        _tenant, key = _issue_key(server_module)
+
+        response = client.post(
+            "/v1/messages",
+            json={
+                "model": "claude-opus-4-5", "max_tokens": 1024,
+                "messages": [{"role": "user", "content": "hi"}],
+                "response_format": "json_schema",
+                "json_schema": {
+                    "type": "object",
+                    "properties": {"name": {"type": "string"}},
+                    "required": ["name"],
+                },
+            },
+            headers=_auth_headers(key),
+        )
+        assert response.status_code == 200
+        assert fake.call_count == 1
+
+
 # ── L8 Traces — GET /v1/traces, GET /v1/traces/{request_id} ──────────────
 
 def test_get_trace_returns_the_real_trace_for_a_completed_call():

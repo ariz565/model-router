@@ -30,7 +30,10 @@ contract as every real provider adapter.
 from __future__ import annotations
 
 import json
+import inspect
 import os
+import secrets
+from datetime import datetime, timedelta, timezone
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -38,7 +41,7 @@ from datetime import datetime, timezone
 from typing import Annotated, Literal
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Response
-from fastapi.responses import StreamingResponse
+from fastapi.responses import PlainTextResponse, StreamingResponse
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -66,6 +69,26 @@ from modelrouter.providers.adapters import (
 from modelrouter.registry import ModelRegistry, example_registry
 from modelrouter.router import ModelRouter
 from modelrouter.tenancy import ApiKey, TenancyRepo, create_tenancy_repo
+from modelrouter.identity.authz import (
+    AuthzContext,
+    PermissionDeniedError,
+    Principal,
+    ResourceScope,
+    api_key_principal,
+    resolve_authz,
+)
+from modelrouter.identity.factory import create_identity_stack
+from modelrouter.identity.ports import IdentityRepo
+from modelrouter.identity.service import IdentityService
+from modelrouter.identity.sso.factory import create_sso_service, resolve_redirect_uri, sso_is_enabled
+from modelrouter.identity.sso.sessions import SESSION_COOKIE_NAME
+from modelrouter.evaluation.comparison import ComparisonService
+from modelrouter.observability.metrics import MetricsService
+from modelrouter.observability.replay import (
+    CaptureExpiredError,
+    InMemoryReplayStore,
+    ReplayStore,
+)
 
 _api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
 
@@ -75,26 +98,111 @@ BOOTSTRAP_TENANT_NAME = "default"
 BOOTSTRAP_CREDIT_USD_ENV_VAR = "MODELROUTER_BOOTSTRAP_CREDIT_USD"
 DEFAULT_BOOTSTRAP_CREDIT_USD = 20.0
 
+# One message for every authentication failure -- see require_principal's own
+# docstring on why the cause is never disclosed.
+_AUTH_FAILED_DETAIL = "missing or invalid credentials"
 
-async def require_tenant_key(
+# The Prometheus endpoint spans every tenant, so it authenticates as
+# infrastructure rather than as a tenant. Unset ⇒ the route 404s (fail closed).
+METRICS_TOKEN_ENV_VAR = "MODELROUTER_METRICS_TOKEN"
+
+
+async def require_principal(
     authorization: Annotated[str | None, Depends(_api_key_header)], request: Request,
-) -> ApiKey:
-    """Every non-discovery route depends on this. Resolves the bearer token
-    against `TenancyRepo.resolve_api_key()` — O(1) indexed lookup, never
-    plaintext comparison against a single shared secret. Always requires a
-    real, active key for a real, active tenant; there is deliberately no
-    "auth disabled" fallback anymore (that was the old shared-key module's
-    behavior when unset — the hard-cutover replacement is stricter by
-    design, not by accident)."""
-    if authorization is None or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="missing Authorization: Bearer <key>")
-    plaintext_key = authorization.removeprefix("Bearer ")
-    tenancy_repo: TenancyRepo = request.app.state.tenancy_repo
-    api_key = tenancy_repo.resolve_api_key(plaintext_key)
-    if api_key is None:
-        raise HTTPException(status_code=401, detail="invalid, revoked, or unknown API key")
-    tenancy_repo.touch_api_key(api_key.key_id)
-    return api_key
+) -> Principal:
+    """The single authentication seam for every non-discovery route.
+
+    Two credential types resolve to ONE `Principal` (identity/authz.py): a
+    machine's `Authorization: Bearer mr_…` API key, and a human's session
+    cookie from SSO. Everything downstream — accounting, tracing, routing,
+    authorization — receives a `Principal` and cannot tell which it was, which
+    is what keeps "is this a key or a person" branching out of every handler.
+
+    **Bearer is tried first, then the cookie.** An explicit credential should
+    always win over an ambient one: if a caller sends a key, honoring a
+    leftover browser cookie instead would silently act as the wrong subject.
+
+    **Every failure is the same opaque 401.** Missing, malformed, unknown,
+    revoked, expired, suspended tenant, membership removed — one message. The
+    caller's next action is identical in all of them (obtain a valid
+    credential), and distinguishing them tells an attacker which of their
+    guesses was closer, the same rule `TenancyRepo.resolve_api_key()` already
+    follows internally."""
+    if authorization is not None and authorization.startswith("Bearer "):
+        tenancy_repo: TenancyRepo = request.app.state.tenancy_repo
+        api_key = tenancy_repo.resolve_api_key(authorization.removeprefix("Bearer "))
+        if api_key is None:
+            raise HTTPException(status_code=401, detail=_AUTH_FAILED_DETAIL)
+        tenancy_repo.touch_api_key(api_key.key_id)
+        return api_key_principal(api_key)
+
+    session_principal_result = _principal_from_session_cookie(request)
+    if session_principal_result is not None:
+        return session_principal_result
+    raise HTTPException(status_code=401, detail=_AUTH_FAILED_DETAIL)
+
+
+def _principal_from_session_cookie(request: Request) -> Principal | None:
+    """`None` when SSO isn't configured for this deployment (the normal state
+    when running with API keys only — `app.state.sso` is `None`), when no
+    cookie is present, or when the session is invalid for any reason.
+
+    `SsoService.authenticate()` does the real work, including re-checking org
+    membership on every request so a removed user's session dies immediately."""
+    sso_service = getattr(request.app.state, "sso", None)
+    if sso_service is None:
+        return None
+    token = request.cookies.get(SESSION_COOKIE_NAME)
+    if not token:
+        return None
+    authenticated = sso_service.authenticate(token)
+    if authenticated is None:
+        return None
+    _session, principal = authenticated
+    return principal
+
+
+def require_authz(permission: str):
+    """Builds a FastAPI dependency that resolves the caller's effective
+    permissions on the addressed resource and enforces one permission.
+
+    **Why a dependency rather than a decorator** — this is a real FastAPI
+    constraint, not a style preference. A dependency participates in the DI
+    graph, so it can declare its own `Depends(require_principal)` and read
+    path params through `Request`; a decorator wrapping the handler would have
+    to scrape `kwargs` for both. Dependencies are also cached per request (so
+    checking twice costs one resolution), overridable via
+    `app.dependency_overrides` in tests, and visible in the generated OpenAPI
+    schema. Most importantly, FastAPI *introspects the handler signature* to
+    build request validation — a decorator that isn't scrupulous with
+    `functools.wraps` silently corrupts that, which is a failure mode with no
+    error message.
+
+    Authorization is deliberately NOT middleware either: Starlette middleware
+    runs before route resolution, so it has no path params and would be reduced
+    to regex-matching URLs.
+
+    `workspace_id`/`project_id` are read from the path when present and are
+    treated as untrusted — `resolve_authz` verifies each actually belongs to the
+    principal's tenant before granting anything based on it."""
+
+    async def dependency(
+        request: Request, principal: Annotated[Principal, Depends(require_principal)],
+    ) -> AuthzContext:
+        identity_repo: IdentityRepo = request.app.state.identity
+        scope = ResourceScope(
+            tenant_id=principal.tenant_id,
+            workspace_id=request.path_params.get("workspace_id"),
+            project_id=request.path_params.get("project_id"),
+        )
+        context = resolve_authz(identity_repo, principal, scope)
+        try:
+            context.require(permission)
+        except PermissionDeniedError as e:
+            raise HTTPException(status_code=403, detail=f"missing permission: {e.permission}") from e
+        return context
+
+    return dependency
 
 
 def _bootstrap_tenant_if_empty(tenancy_repo: TenancyRepo, accounting: AccountingService) -> None:
@@ -119,8 +227,48 @@ def _bootstrap_tenant_if_empty(tenancy_repo: TenancyRepo, accounting: Accounting
     )
 
 
+def _optional_replay_key() -> bytes | None:
+    """The BYOK master key when one is configured, else `None`.
+
+    Deliberately does NOT raise when unset, unlike `tenancy/byok.py`'s own
+    resolver: a BYOK provider credential is useless to us unencrypted and always
+    worth protecting, whereas requiring a master key to use replay at all would
+    make the feature unavailable in exactly the zero-infra tier where local
+    evaluation happens. `cryptography` missing is handled the same way — the
+    capability degrades to in-process plaintext, which `replay.py` documents,
+    rather than the server refusing to start."""
+    key = os.environ.get("MODELROUTER_BYOK_MASTER_KEY")
+    if not key:
+        return None
+    try:
+        import cryptography  # noqa: F401
+    except ImportError:
+        print(
+            "[modelrouter.server] MODELROUTER_BYOK_MASTER_KEY is set but "
+            "'cryptography' is not installed; replay captures will NOT be "
+            "encrypted at rest. Install with: pip install -e '.[crypto]'"
+        )
+        return None
+    return key.encode()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """Constructs every subsystem, in dependency order, then tears down what
+    holds real resources.
+
+    **Construction order is not incidental.** Storage tiers come first because
+    everything else is built on them; the router comes last because it takes
+    several of them as constructor arguments. A failure anywhere here aborts
+    startup — that is deliberate: a gateway that boots "successfully" with no
+    accounting store would silently serve unbilled traffic, which is far worse
+    than failing to start with a clear error.
+
+    **Optional subsystems are absent, not disabled.** SSO is constructed only
+    when configured (`create_sso_service()` returns `None` otherwise) and its
+    routes are only mounted when it exists. There is no feature flag consulted
+    at request time — `app.state.sso is None` IS the off state, which means the
+    off path has no code of its own to get wrong."""
     settings = Settings()
     skipped: list[str] = []
     adapters = settings.build_adapters(on_skip=lambda name, exc: skipped.append(name))
@@ -128,6 +276,7 @@ async def lifespan(app: FastAPI):
     tenancy_repo = create_tenancy_repo()
     accounting_service = create_accounting_service()
     trace_service = create_trace_service()
+    identity_repo, audit_log = create_identity_stack()
     # [Illustrative data — see registry/example_data.py's own docstring] A
     # real deployment populates ModelRegistry from an actual pricing feed;
     # nothing here fabricates real prices, same honesty note example_catalog()
@@ -137,6 +286,17 @@ async def lifespan(app: FastAPI):
     app.state.tenancy_repo = tenancy_repo
     app.state.accounting = accounting_service
     app.state.traces = trace_service
+    app.state.identity = identity_repo
+    app.state.audit = audit_log
+    # Aggregation reads the trace log; it holds no state of its own, so there is
+    # no second source of truth to keep in sync (see metrics.py).
+    app.state.metrics = MetricsService(trace_service)
+    # Replay capture is opt-in per request. Encrypted at rest when a BYOK master
+    # key is configured; plaintext in-process otherwise, which replay.py states
+    # explicitly rather than requiring a key and making the feature unavailable
+    # in the zero-infra tier.
+    app.state.replay = InMemoryReplayStore(_optional_replay_key())
+    app.state.identity_service = IdentityService(identity_repo, tenancy_repo, audit_log)
     app.state.registry = registry
     app.state.router = ModelRouter(
         adapters, accounting=accounting_service, price_lookup=registry.price_lookup(),
@@ -144,10 +304,48 @@ async def lifespan(app: FastAPI):
     )
     app.state.settings = settings
 
+    # ── Optional: SSO. Absent unless configured; see the docstring above. ──
+    app.state.sso = create_sso_service(identity_repo)
+    app.state.sso_redirect_uri = resolve_redirect_uri() if sso_is_enabled() else None
+    if app.state.sso is not None:
+        print("[modelrouter.server] SSO enabled (OIDC); human sessions accepted alongside API keys.")
+
     if skipped:
         print(f"[modelrouter.server] skipped providers (SDK not installed): {skipped}")
     _bootstrap_tenant_if_empty(tenancy_repo, accounting_service)
-    yield
+
+    try:
+        yield
+    finally:
+        # Shutdown, in reverse construction order. Each step is independently
+        # guarded so one subsystem failing to close cannot skip the others —
+        # otherwise a single bad close leaks everything after it.
+        #
+        # The trace publisher is the one that genuinely matters: Kafka holds
+        # traces in an internal batch, and `stop()` is what flushes them.
+        # Skipping it silently discards records that were already accepted.
+        await _close_quietly("trace publisher", getattr(trace_service, "_publisher", None))
+
+
+async def _close_quietly(label: str, subject) -> None:
+    """Calls `stop()`/`close()` if the object has one, awaiting it when it's a
+    coroutine, and reports rather than raises on failure.
+
+    Shutdown is the one place where swallowing an exception is correct: the
+    process is going away regardless, and raising here would mask the shutdown
+    of everything after it. It is still PRINTED — a silently failed close is how
+    connection and buffer leaks go unnoticed across restarts."""
+    if subject is None:
+        return
+    closer = getattr(subject, "stop", None) or getattr(subject, "close", None)
+    if closer is None:
+        return
+    try:
+        result = closer()
+        if inspect.isawaitable(result):
+            await result
+    except Exception as e:   # noqa: BLE001 -- see the docstring
+        print(f"[modelrouter.server] error closing {label}: {type(e).__name__}: {e}")
 
 
 app = FastAPI(
@@ -155,6 +353,32 @@ app = FastAPI(
     description="Multi-provider LLM gateway — chat, image, speech, transcription, all through one API.",
     lifespan=lifespan,
 )
+
+# ── Identity: org/workspace/project/member/invitation management ──────────
+#
+# Imported here rather than at module top so the import order is obvious: this
+# router's own dependencies reach back into `require_authz` above, and mounting
+# after `app` exists keeps that one-directional.
+from modelrouter.identity.http import router as _identity_router   # noqa: E402
+
+app.include_router(_identity_router)
+
+# ── Optional: SSO. These two lines plus `identity/sso/` are the ENTIRE
+# footprint of the feature -- delete them and nothing else changes. Mounted
+# unconditionally at import time (the app object has no state yet), but every
+# handler resolves `app.state.sso`, which is `None` when SSO isn't configured,
+# so the routes answer 404 rather than half-working.
+from modelrouter.identity.sso.http import router as _sso_router   # noqa: E402
+
+app.include_router(_sso_router)
+
+# ── Optional: synthetic data generation. Same two-line footprint as SSO —
+# delete `synthetic/` and these lines and nothing else changes. Its endpoints
+# resolve `app.state.synthetic_sources`, which is empty unless an operator
+# registers a source, so they answer 404 rather than half-working.
+from modelrouter.synthetic.http import router as _synthetic_router   # noqa: E402
+
+app.include_router(_synthetic_router)
 
 
 def _metadata_dict(metadata: RouterMetadata) -> dict:
@@ -286,9 +510,12 @@ class ChatCompletionRequest(BaseModel):
     contract_policy: Literal["fail", "retry"] = "fail"
     stream: bool = False
     tools: list[dict] | None = None   # OpenAI tools[] shape -- see ChatRequest.tools's own docstring
+    # Opt-in payload retention for POST /v1/replay/{request_id}. Off by default;
+    # see observability/replay.py on why capture is opt-in and short-lived.
+    capture_for_replay: bool = False
 
 
-def _effective_max_tokens(requested: int | None, api_key: ApiKey, tenant, request: Request) -> int | None:
+def _effective_max_tokens(requested: int | None, principal: Principal, tenant, request: Request) -> int | None:
     """Part 3.3's ceiling-minimization — the key/tenant half. The model's own
     `max_output_tokens` half is clamped separately, per candidate endpoint,
     inside router.py's fallback loop (`ModelRouter._clamp_for_endpoint`) —
@@ -296,7 +523,7 @@ def _effective_max_tokens(requested: int | None, api_key: ApiKey, tenant, reques
     be folded into this single up-front min() the way key/tenant can.
     `None` ceilings simply don't participate in the `min()` — unset means
     unlimited at that level, not zero."""
-    ceilings = [c for c in (requested, api_key.token_ceiling, tenant.token_ceiling if tenant else None)
+    ceilings = [c for c in (requested, principal.token_ceiling, tenant.token_ceiling if tenant else None)
                 if c is not None]
     return min(ceilings) if ceilings else None
 
@@ -402,12 +629,12 @@ async def _stream_chat_response(
 @app.post("/v1/chat")
 async def chat(
     body: ChatCompletionRequest, request: Request, http_response: Response,
-    api_key: Annotated[ApiKey, Depends(require_tenant_key)],
+    principal: Annotated[Principal, Depends(require_principal)],
 ):
     router = _router(request)
     tenancy_repo: TenancyRepo = request.app.state.tenancy_repo
-    tenant = tenancy_repo.get_tenant(api_key.tenant_id)
-    effective_max_tokens = _effective_max_tokens(body.max_tokens, api_key, tenant, request)
+    tenant = tenancy_repo.get_tenant(principal.tenant_id)
+    effective_max_tokens = _effective_max_tokens(body.max_tokens, principal, tenant, request)
     chat_request = _ChatRequest(
         messages=[m.model_dump(exclude_none=True) for m in body.messages],
         model=body.models[0].partition(":")[2],
@@ -419,12 +646,13 @@ async def chat(
         tools=body.tools,
         tags=_extract_tags(request),
         prompt_version=_extract_prompt_version(request), policy_version=_extract_policy_version(request),
+        capture_for_replay=body.capture_for_replay,
     )
 
     if body.stream:
-        return await _stream_chat_response(router, chat_request, api_key.tenant_id, models=body.models)
+        return await _stream_chat_response(router, chat_request, principal.tenant_id, models=body.models)
 
-    response, metadata = await router.chat(chat_request, models=body.models, tenant_id=api_key.tenant_id)
+    response, metadata = await router.chat(chat_request, models=body.models, tenant_id=principal.tenant_id)
 
     if response is None:
         _raise_for_failed_chat(metadata)
@@ -432,7 +660,40 @@ async def chat(
     for header, value in _degradation_headers(metadata.requested_model, metadata.served_by, metadata.pipeline).items():
         http_response.headers[header] = value
 
+    _capture_for_replay_if_requested(request, chat_request, metadata, principal)
     return _native_chat_response_body(response, metadata, body.max_tokens, effective_max_tokens)
+
+
+def _capture_for_replay_if_requested(
+    request: Request, chat_request, metadata: RouterMetadata, principal: Principal,
+) -> None:
+    """Stores the request payload for later replay, but ONLY when the caller
+    asked for it and the call produced a real `request_id` to key it on.
+
+    Capture happens here rather than inside `router.py` deliberately: it is not a
+    routing concern, it needs nothing the router has that the handler doesn't, and
+    keeping it out of the hot path means the routing pipeline has no awareness of
+    payload retention at all.
+
+    Failures are swallowed-and-reported, never propagated: a capture problem must
+    not fail a chat call that already succeeded and was already billed. Same
+    reasoning as the trace publisher's best-effort contract — and, like it, the
+    failure is printed rather than silently dropped."""
+    if not getattr(chat_request, "capture_for_replay", False):
+        return
+    if metadata.request_id is None:
+        return
+    replay_store: ReplayStore | None = getattr(request.app.state, "replay", None)
+    if replay_store is None:
+        return
+    try:
+        replay_store.capture(
+            metadata.request_id, tenant_id=principal.tenant_id,
+            messages=chat_request.messages, model_spec=metadata.served_by,
+            tools=chat_request.tools,
+        )
+    except Exception as e:   # noqa: BLE001 -- see the docstring
+        print(f"[modelrouter.server] replay capture failed: {type(e).__name__}: {e}")
 
 
 # ── Strategy-based routing surfaces (native-only) ─────────────────────────
@@ -467,7 +728,7 @@ class AutoChatRequest(BaseModel):
 @app.post("/v1/chat/auto")
 async def chat_auto(
     body: AutoChatRequest, request: Request, http_response: Response,
-    api_key: Annotated[ApiKey, Depends(require_tenant_key)],
+    principal: Annotated[Principal, Depends(require_principal)],
 ):
     """AutoStrategy over HTTP: classify -> rank by task affinity -> apply the
     cost_quality_tradeoff dial -> ordered fallback array — exactly router.py's
@@ -477,8 +738,8 @@ async def chat_auto(
     and `/v1/chat`'s hard pin never took that path."""
     router = _router(request)
     tenancy_repo: TenancyRepo = request.app.state.tenancy_repo
-    tenant = tenancy_repo.get_tenant(api_key.tenant_id)
-    effective_max_tokens = _effective_max_tokens(body.max_tokens, api_key, tenant, request)
+    tenant = tenancy_repo.get_tenant(principal.tenant_id)
+    effective_max_tokens = _effective_max_tokens(body.max_tokens, principal, tenant, request)
     chat_request = _ChatRequest(
         messages=[m.model_dump(exclude_none=True) for m in body.messages],
         model="auto",   # never dispatched -- AutoStrategy.resolve() picks the real candidates
@@ -499,11 +760,11 @@ async def chat_auto(
 
     if body.stream:
         return await _stream_chat_response(
-            router, chat_request, api_key.tenant_id, strategy=strategy, routing_ctx=routing_ctx,
+            router, chat_request, principal.tenant_id, strategy=strategy, routing_ctx=routing_ctx,
         )
 
     response, metadata = await router.chat(
-        chat_request, strategy=strategy, routing_ctx=routing_ctx, tenant_id=api_key.tenant_id,
+        chat_request, strategy=strategy, routing_ctx=routing_ctx, tenant_id=principal.tenant_id,
     )
     if response is None:
         _raise_for_failed_chat(metadata)
@@ -530,7 +791,7 @@ class FusionChatRequest(BaseModel):
 @app.post("/v1/chat/fusion")
 async def chat_fusion(
     body: FusionChatRequest, request: Request,
-    api_key: Annotated[ApiKey, Depends(require_tenant_key)],
+    principal: Annotated[Principal, Depends(require_principal)],
 ):
     """Panel fan-out + judge over HTTP: every panelist AND the judge each get
     their own guardrails/retry/fallback/billing (real chat() sub-calls, per
@@ -538,8 +799,8 @@ async def chat_fusion(
     outer request (see that method's tenant_id-threading docstring)."""
     router = _router(request)
     tenancy_repo: TenancyRepo = request.app.state.tenancy_repo
-    tenant = tenancy_repo.get_tenant(api_key.tenant_id)
-    effective_max_tokens = _effective_max_tokens(body.max_tokens, api_key, tenant, request)
+    tenant = tenancy_repo.get_tenant(principal.tenant_id)
+    effective_max_tokens = _effective_max_tokens(body.max_tokens, principal, tenant, request)
     chat_request = _ChatRequest(
         messages=[m.model_dump(exclude_none=True) for m in body.messages],
         model="fusion",   # never dispatched -- panel_models/judge_model are what actually get called
@@ -551,7 +812,7 @@ async def chat_fusion(
     )
     strategy = FusionStrategy(panel_models=body.panel_models, judge_model=body.judge_model, chat_fn=router.chat)
 
-    response, metadata = await router.chat(chat_request, strategy=strategy, tenant_id=api_key.tenant_id)
+    response, metadata = await router.chat(chat_request, strategy=strategy, tenant_id=principal.tenant_id)
     if response is None:
         _raise_for_failed_chat(metadata)
 
@@ -580,7 +841,7 @@ class BodyBuilderChatRequest(BaseModel):
 @app.post("/v1/chat/bodybuilder")
 async def chat_bodybuilder(
     body: BodyBuilderChatRequest, request: Request,
-    api_key: Annotated[ApiKey, Depends(require_tenant_key)],
+    principal: Annotated[Principal, Depends(require_principal)],
 ):
     """Ordered multi-model plan over HTTP: each step is a real chat() sub-call
     (guardrails/retry/fallback/billing of its own, per BodyBuilderStrategy.
@@ -588,8 +849,8 @@ async def chat_bodybuilder(
     against the SAME tenant as this outer request."""
     router = _router(request)
     tenancy_repo: TenancyRepo = request.app.state.tenancy_repo
-    tenant = tenancy_repo.get_tenant(api_key.tenant_id)
-    effective_max_tokens = _effective_max_tokens(body.max_tokens, api_key, tenant, request)
+    tenant = tenancy_repo.get_tenant(principal.tenant_id)
+    effective_max_tokens = _effective_max_tokens(body.max_tokens, principal, tenant, request)
     chat_request = _ChatRequest(
         messages=[m.model_dump(exclude_none=True) for m in body.messages],
         model="bodybuilder",   # never dispatched -- each step's own model_spec is what actually gets called
@@ -602,7 +863,7 @@ async def chat_bodybuilder(
     plan = [PlanStep(name=s.name, model_spec=s.model_spec, prompt_template=s.prompt_template) for s in body.plan]
     strategy = BodyBuilderStrategy(chat_fn=router.chat, plan=plan)
 
-    response, metadata = await router.chat(chat_request, strategy=strategy, tenant_id=api_key.tenant_id)
+    response, metadata = await router.chat(chat_request, strategy=strategy, tenant_id=principal.tenant_id)
     if response is None:
         _raise_for_failed_chat(metadata)
 
@@ -624,7 +885,7 @@ class HedgeChatRequest(BaseModel):
 @app.post("/v1/chat/hedge")
 async def chat_hedge(
     body: HedgeChatRequest, request: Request,
-    api_key: Annotated[ApiKey, Depends(require_tenant_key)],
+    principal: Annotated[Principal, Depends(require_principal)],
 ):
     """Part 6.6 over HTTP: races every candidate in `models` concurrently via
     `ModelRouter.hedged_chat()`, takes the first real success, cancels the
@@ -632,8 +893,8 @@ async def chat_hedge(
     `/v1/chat` and explicitly list every candidate to race."""
     router = _router(request)
     tenancy_repo: TenancyRepo = request.app.state.tenancy_repo
-    tenant = tenancy_repo.get_tenant(api_key.tenant_id)
-    effective_max_tokens = _effective_max_tokens(body.max_tokens, api_key, tenant, request)
+    tenant = tenancy_repo.get_tenant(principal.tenant_id)
+    effective_max_tokens = _effective_max_tokens(body.max_tokens, principal, tenant, request)
     chat_request = _ChatRequest(
         messages=[m.model_dump(exclude_none=True) for m in body.messages],
         model=body.models[0].partition(":")[2],
@@ -644,7 +905,7 @@ async def chat_hedge(
         prompt_version=_extract_prompt_version(request), policy_version=_extract_policy_version(request),
     )
 
-    response, metadata = await router.hedged_chat(chat_request, models=body.models, tenant_id=api_key.tenant_id)
+    response, metadata = await router.hedged_chat(chat_request, models=body.models, tenant_id=principal.tenant_id)
     if response is None:
         _raise_for_failed_chat(metadata)
 
@@ -812,7 +1073,7 @@ async def _stream_openai_compat_response(
 @app.post("/v1/chat/completions")
 async def chat_completions(
     body: OpenAIChatCompletionRequest, request: Request, http_response: Response,
-    api_key: Annotated[ApiKey, Depends(require_tenant_key)],
+    principal: Annotated[Principal, Depends(require_principal)],
 ):
     registry: ModelRegistry = request.app.state.registry
     models = _resolve_compat_model(body.model, registry)
@@ -821,9 +1082,9 @@ async def chat_completions(
 
     router = _router(request)
     tenancy_repo: TenancyRepo = request.app.state.tenancy_repo
-    tenant = tenancy_repo.get_tenant(api_key.tenant_id)
+    tenant = tenancy_repo.get_tenant(principal.tenant_id)
     requested_max_tokens = body.max_completion_tokens or body.max_tokens
-    effective_max_tokens = _effective_max_tokens(requested_max_tokens, api_key, tenant, request)
+    effective_max_tokens = _effective_max_tokens(requested_max_tokens, principal, tenant, request)
     response_format = (
         body.response_format.type
         if body.response_format is not None and body.response_format.type != "text"
@@ -849,9 +1110,9 @@ async def chat_completions(
     )
 
     if body.stream:
-        return await _stream_openai_compat_response(router, chat_request, models, api_key.tenant_id, body.model)
+        return await _stream_openai_compat_response(router, chat_request, models, principal.tenant_id, body.model)
 
-    response, metadata = await router.chat(chat_request, models=models, tenant_id=api_key.tenant_id)
+    response, metadata = await router.chat(chat_request, models=models, tenant_id=principal.tenant_id)
     if response is None:
         _raise_for_failed_chat(metadata)
 
@@ -902,6 +1163,15 @@ async def chat_completions(
 # being faked; verbatim `anthropic-*`/`x-claude-code-*` header forwarding
 # and `x-claude-code-session-id` trace correlation are NOT built yet — no
 # L8 trace/span system exists in this codebase to correlate into.
+#
+# L7 Contracts fix, same shape as the OpenAI-compat surface's own
+# `contract_policy` field (line ~698's comment: "NOT an OpenAI field -- our
+# own additive extension"): Anthropic's real API has no `response_format`
+# concept either, but this is OUR wire surface's own additive extension, not
+# a re-implementation of Anthropic's API — omitting it here (as this class
+# did until now) silently made contract enforcement unreachable for every
+# Claude Code / Zed / VS Code Copilot Messages-mode caller even though the
+# native and OpenAI-compat surfaces both fully support it.
 
 _ANTHROPIC_FINISH_REASON_MAP = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use"}
 
@@ -916,6 +1186,9 @@ class AnthropicMessagesRequest(BaseModel):
     temperature: float = 1.0
     stream: bool = False
     tools: list[dict] | None = None
+    response_format: Literal["json_object", "json_schema"] | None = None   # additive -- see comment above
+    json_schema: dict | None = None                                        # additive -- see comment above
+    contract_policy: Literal["fail", "retry"] = "fail"                     # additive -- see comment above
 
 
 class AnthropicCountTokensRequest(BaseModel):
@@ -1055,7 +1328,7 @@ async def _stream_anthropic_compat_response(
 @app.post("/v1/messages")
 async def messages(
     body: AnthropicMessagesRequest, request: Request, http_response: Response,
-    api_key: Annotated[ApiKey, Depends(require_tenant_key)],
+    principal: Annotated[Principal, Depends(require_principal)],
 ):
     registry: ModelRegistry = request.app.state.registry
     models = _resolve_compat_model(body.model, registry)
@@ -1064,8 +1337,8 @@ async def messages(
 
     router = _router(request)
     tenancy_repo: TenancyRepo = request.app.state.tenancy_repo
-    tenant = tenancy_repo.get_tenant(api_key.tenant_id)
-    effective_max_tokens = _effective_max_tokens(body.max_tokens, api_key, tenant, request)
+    tenant = tenancy_repo.get_tenant(principal.tenant_id)
+    effective_max_tokens = _effective_max_tokens(body.max_tokens, principal, tenant, request)
 
     chat_request = _ChatRequest(
         messages=_anthropic_messages_to_internal(body.messages, body.system),
@@ -1075,12 +1348,15 @@ async def messages(
         tools=translate_tools_from_anthropic(body.tools) if body.tools else None,
         tags=_extract_tags(request),
         prompt_version=_extract_prompt_version(request), policy_version=_extract_policy_version(request),
+        response_format=body.response_format,
+        json_schema=body.json_schema,
+        contract_policy=body.contract_policy,
     )
 
     if body.stream:
-        return await _stream_anthropic_compat_response(router, chat_request, models, api_key.tenant_id, body.model)
+        return await _stream_anthropic_compat_response(router, chat_request, models, principal.tenant_id, body.model)
 
-    response, metadata = await router.chat(chat_request, models=models, tenant_id=api_key.tenant_id)
+    response, metadata = await router.chat(chat_request, models=models, tenant_id=principal.tenant_id)
     if response is None:
         _raise_for_failed_chat(metadata)
 
@@ -1115,7 +1391,7 @@ async def messages(
 
 @app.post("/v1/messages/count_tokens")
 async def count_tokens(
-    body: AnthropicCountTokensRequest, _api_key: Annotated[ApiKey, Depends(require_tenant_key)],
+    body: AnthropicCountTokensRequest, _principal: Annotated[Principal, Depends(require_principal)],
 ):
     """A real, honest APPROXIMATION, not Anthropic's real tokenizer — same
     chars/4 heuristic `compression.py` already uses everywhere else in this
@@ -1129,9 +1405,9 @@ async def count_tokens(
 # ── Usage — the first real read-surface over L3's accounting ────────────
 
 @app.get("/v1/usage")
-async def usage(api_key: Annotated[ApiKey, Depends(require_tenant_key)], request: Request):
+async def usage(principal: Annotated[Principal, Depends(require_principal)], request: Request):
     accounting: AccountingService = request.app.state.accounting
-    account = accounting.balance(api_key.tenant_id)
+    account = accounting.balance(principal.tenant_id)
     return {
         "tenant_id": account.tenant_id,
         "purchased_usd": account.purchased_usd,
@@ -1162,22 +1438,156 @@ def _trace_dict(trace) -> dict:
 
 @app.get("/v1/traces")
 async def list_traces(
-    api_key: Annotated[ApiKey, Depends(require_tenant_key)], request: Request, limit: int = 50,
+    principal: Annotated[Principal, Depends(require_principal)], request: Request, limit: int = 50,
 ):
     traces: TraceService = request.app.state.traces
-    return {"data": [_trace_dict(t) for t in traces.list_traces(api_key.tenant_id, limit=limit)]}
+    return {"data": [_trace_dict(t) for t in traces.list_traces(principal.tenant_id, limit=limit)]}
 
 
 @app.get("/v1/traces/{request_id}")
 async def get_trace(
-    request_id: str, api_key: Annotated[ApiKey, Depends(require_tenant_key)], request: Request,
+    request_id: str, principal: Annotated[Principal, Depends(require_principal)], request: Request,
 ):
     traces: TraceService = request.app.state.traces
     tree = traces.get_trace_tree(request_id)
-    tree = [t for t in tree if t.tenant_id == api_key.tenant_id]   # never leak another tenant's trace
+    tree = [t for t in tree if t.tenant_id == principal.tenant_id]   # never leak another tenant's trace
     if not tree:
         raise HTTPException(status_code=404, detail={"error": "trace not found"})
     return {"trace": _trace_dict(tree[0]), "tree": [_trace_dict(t) for t in tree]}
+
+
+# ── Metrics — aggregation over the durable trace log ─────────────────────
+
+@app.get("/v1/metrics")
+async def tenant_metrics(
+    principal: Annotated[Principal, Depends(require_principal)], request: Request,
+    window_minutes: int | None = None,
+):
+    """The caller's OWN aggregated metrics: request counts, error rate, latency
+    percentiles, cost, and a per-model breakdown.
+
+    `include_tenant_breakdown` is deliberately NOT exposed here — a per-tenant
+    breakdown handed to one customer would disclose every other customer's
+    volume and spend. Cross-tenant aggregation lives on `/metrics` below, which
+    is operator-only."""
+    metrics: MetricsService = request.app.state.metrics
+    since = (
+        datetime.now(timezone.utc) - timedelta(minutes=window_minutes)
+        if window_minutes else None
+    )
+    return metrics.summarize(tenant_id=principal.tenant_id, since=since).as_dict()
+
+
+@app.get("/metrics")
+async def prometheus_metrics(request: Request):
+    """Prometheus exposition endpoint, spanning EVERY tenant.
+
+    **Guarded by a dedicated token, not by a tenant credential**, and NOT mounted
+    at all unless `MODELROUTER_METRICS_TOKEN` is set. Two reasons this can't just
+    reuse `require_principal`:
+
+    1. This response contains every tenant's request volume and spend. No tenant
+       credential should ever reach it, however privileged that tenant is inside
+       its own org — there is no role in this system that means "may read other
+       customers' data."
+    2. A Prometheus scraper has no tenant identity to present. It is
+       infrastructure, so it authenticates as infrastructure.
+
+    Unset token ⇒ 404 rather than an open endpoint: fail closed, because the
+    failure mode of the alternative is silently publishing every customer's spend.
+    """
+    expected_token = os.environ.get(METRICS_TOKEN_ENV_VAR)
+    if not expected_token:
+        raise HTTPException(status_code=404, detail="metrics endpoint is not enabled")
+    supplied = request.headers.get("authorization", "")
+    presented = supplied.removeprefix("Bearer ").strip()
+    # Constant-time comparison: a token check that short-circuits on the first
+    # differing byte is measurably guessable one character at a time.
+    if not presented or not secrets.compare_digest(presented, expected_token):
+        raise HTTPException(status_code=401, detail=_AUTH_FAILED_DETAIL)
+
+    metrics: MetricsService = request.app.state.metrics
+    return PlainTextResponse(
+        metrics.prometheus_text(),
+        # The version parameter is part of the format contract; scrapers use it
+        # to pick a parser.
+        media_type="text/plain; version=0.0.4; charset=utf-8",
+    )
+
+
+# ── Model comparison and replay — "which model earns its cost" ────────────
+
+class CompareRequestBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    prompt: str = Field(min_length=1)
+    models: list[str] = Field(min_length=1, max_length=8)
+    expected: str | None = None
+    scorer: Literal["exact", "regex", "schema", "judge"] | None = None
+    max_tokens: int | None = Field(default=None, ge=1)
+
+
+class ReplayRequestBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    models: list[str] = Field(min_length=1, max_length=8)
+    expected: str | None = None
+    scorer: Literal["exact", "regex", "schema", "judge"] | None = None
+
+
+@app.post("/v1/compare")
+async def compare_models(
+    body: CompareRequestBody, request: Request,
+    principal: Annotated[Principal, Depends(require_principal)],
+):
+    """One prompt, N models, every answer side by side with its real cost and
+    latency — plus a score when `expected` is supplied.
+
+    Distinct from `/v1/chat/fusion`, which returns only the judge's synthesized
+    answer and discards the individual outputs. `models` is capped at 8 because
+    each candidate is a real, billed provider call: a comparison is a
+    deliberately expensive operation and an uncapped fan-out is a way to spend a
+    tenant's whole budget in one request."""
+    comparison = ComparisonService(chat_fn=_router(request).chat)
+    try:
+        result = await comparison.compare(
+            body.prompt, body.models, tenant_id=principal.tenant_id,
+            expected=body.expected, scorer=body.scorer, max_tokens=body.max_tokens,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return result.as_dict()
+
+
+@app.post("/v1/replay/{request_id}")
+async def replay_request(
+    request_id: str, body: ReplayRequestBody, request: Request,
+    principal: Annotated[Principal, Depends(require_principal)],
+):
+    """Re-runs a previously CAPTURED request against N models.
+
+    Only requests sent with `capture_for_replay` are available, and only within
+    their retention window — see `observability/replay.py` on why capture is
+    opt-in and short-lived rather than the default."""
+    replay_store: ReplayStore = request.app.state.replay
+    try:
+        captured = replay_store.get(request_id, principal.tenant_id)
+    except CaptureExpiredError as e:
+        raise HTTPException(status_code=410, detail=str(e)) from e
+    if captured is None:
+        raise HTTPException(
+            status_code=404,
+            detail="no captured payload for that request id (send capture_for_replay=true to enable)",
+        )
+
+    comparison = ComparisonService(chat_fn=_router(request).chat)
+    try:
+        result = await comparison.compare_captured(
+            captured, body.models, expected=body.expected, scorer=body.scorer,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return {"replayed_request_id": request_id, **result.as_dict()}
 
 
 # ── Image generation ─────────────────────────────────────────────────────
@@ -1190,7 +1600,7 @@ class ImageRequestBody(BaseModel):
     response_format: Literal["url", "b64_json"] = "url"
 
 
-@app.post("/v1/images", dependencies=[Depends(require_tenant_key)])
+@app.post("/v1/images", dependencies=[Depends(require_principal)])
 async def generate_image(body: ImageRequestBody, request: Request):
     router = _router(request)
     img_request = ImageGenerationRequest(
@@ -1220,7 +1630,7 @@ class SpeechRequestBody(BaseModel):
     response_format: Literal["mp3", "opus", "aac", "flac", "wav"] = "mp3"
 
 
-@app.post("/v1/speech", dependencies=[Depends(require_tenant_key)])
+@app.post("/v1/speech", dependencies=[Depends(require_principal)])
 async def speech(body: SpeechRequestBody, request: Request):
     from fastapi.responses import Response as RawResponse
 
@@ -1244,7 +1654,7 @@ async def speech(body: SpeechRequestBody, request: Request):
 
 # ── Transcription (speech-to-text) ────────────────────────────────────────
 
-@app.post("/v1/transcriptions", dependencies=[Depends(require_tenant_key)])
+@app.post("/v1/transcriptions", dependencies=[Depends(require_principal)])
 async def transcribe(
     request: Request,
     audio_file: Annotated[bytes, File(description="The audio file's raw bytes")],

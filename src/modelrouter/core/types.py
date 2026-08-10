@@ -67,6 +67,16 @@ class ChatRequest:
     # anything L9/6.1 would ever read a historical outcome back from.
     prompt_version: str | None = None
     policy_version: str | None = None
+    # Opt-in payload capture for replay (`observability/replay.py`). Default
+    # False, and that default is load-bearing rather than conservative
+    # boilerplate: `Trace` records metadata only and `EvidenceBundle` stores a
+    # prompt HASH, both deliberately, so nothing in this system retains prompt
+    # text unless a caller explicitly asks for it here. Setting it stores the
+    # messages encrypted, under a short TTL, readable only by the owning tenant —
+    # which is what makes "replay this exact prompt against 4 models" possible
+    # at all. Never inspected by the routing pipeline; `server.py` acts on it
+    # after a call completes.
+    capture_for_replay: bool = False
 
 
 # The two real multimodal message shapes a caller builds `messages` content

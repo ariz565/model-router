@@ -19,10 +19,18 @@ ollama = ["ollama>=0.3"]
 dotenv = ["python-dotenv>=1.0"]    # config.py's .env file loading; real env vars work without it
 server = ["fastapi>=0.110", "uvicorn[standard]>=0.29", "python-multipart>=0.0.9"]
 contracts = ["jsonschema>=4.0"]    # L7 -- real JSON Schema enforcement, not just syntax repair
+redis = ["redis>=6.0"]             # shared-across-replicas EventStore tier + reservation ledger. >=6.0 specifically: store/redis_client.py uses ExponentialWithJitterBackoff for retry backoff
+postgres = ["psycopg[binary]>=3.1", "psycopg-pool>=3.1"]   # durable, shared-across-replicas EventStore tier (store/postgres_events.py)
+kafka = ["aiokafka>=0.11"]         # async trace/eval/evidence publisher (observability/async_publish.py)
+aws = ["boto3>=1.34"]              # SQS publisher + KMS-sealed BYOK vault (observability/async_publish.py, tenancy/byok.py)
+crypto = ["cryptography>=42.0"]    # BYOK credential vault envelope encryption (tenancy/byok.py)
+sso = ["authlib>=1.7", "joserfc>=1.0", "httpx>=0.27"]   # OIDC relying party (identity/sso/) -- joserfc, not authlib.jose, which upstream deprecated
+synthetic-rctgan = ["torch>=2.0", "ctgan>=0.10"]        # OPTIONAL engine for synthetic/. Large download; the default statistical engine needs nothing
 all = [
     "openai>=1.0", "anthropic>=0.39", "ollama>=0.3", "python-dotenv>=1.0",
     "fastapi>=0.110", "uvicorn[standard]>=0.29", "python-multipart>=0.0.9",
-    "jsonschema>=4.0",
+    "jsonschema>=4.0", "redis>=6.0", "psycopg[binary]>=3.1", "psycopg-pool>=3.1",
+    "aiokafka>=0.11", "boto3>=1.34", "cryptography>=42.0",
 ]
 dev = ["pytest>=8", "httpx>=0.27"]   # httpx: FastAPI's TestClient needs it
 

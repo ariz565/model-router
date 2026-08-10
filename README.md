@@ -84,6 +84,37 @@ trust with real money":
   always reported, never silent.
 - Pass-through cost-attribution tags, so spend can be broken down *below* the
   tenant — by feature, end-user, or session — not just by API key.
+- **BYOK (bring your own key)** — a tenant can supply their own provider
+  credential, encrypted at rest (envelope encryption, KMS-ready) and
+  resolved per request; no BYOK key configured falls back to the
+  operator's own credentials automatically.
+
+### Organizations, teams, and access control
+
+- **Organizations → workspaces → projects**, created on registration: signing up
+  yields an org, its first owner, and a working default workspace in one step.
+- **Invite-only membership** with cryptographically-sound, single-use,
+  expiring invitation tokens bound to a role and a target at creation — so an
+  invitation can never be redeemed for more than it was issued for.
+- **Four roles** (owner / admin / member / viewer) whose permissions inherit
+  *down* the hierarchy and never sideways: a workspace admin administers that
+  workspace's projects and has no elevated access to a sibling. Permissions —
+  not role names — are what the code checks, and no one can ever grant a role
+  above their own.
+- **Single sign-on (OIDC + PKCE), one identity provider per organization** —
+  so each customer brings their own Okta/Entra ID/Google Workspace, and the
+  same person can belong to two organizations with two different providers
+  without becoming two accounts.
+- **Immediate revocation.** Sessions are server-side and membership is re-checked
+  on every request, so removing someone or changing their role takes effect on
+  their very next call — not whenever a token happens to expire.
+- **A tamper-evident authorization audit trail** recording every membership and
+  role change *and every refused attempt*, hash-chained per organization.
+- **Human sessions and machine API keys are two independent credentials
+  resolving to one identity**, so nothing downstream needs to know which it was.
+
+See [the identity package README](src/modelrouter/identity/README.md) for the
+end-to-end architecture, the SSO flow, and the threat model behind each check.
 
 ### Wire-compatible API surfaces
 - A native REST API with full control: fallback arrays, strategy selection, rich
@@ -141,6 +172,51 @@ trust with real money":
   the full fan-out, and its true combined cost, in one query.
 - Optional prompt/policy version tagging on every request, so a later regression
   can be traced to a prompt change or a policy change instead of just "the model."
+- **Aggregated metrics** — request counts, error rates, latency percentiles
+  (p50/p95/p99, nearest-rank so a reported p99 is a latency some request really
+  experienced), cost rollups, and a per-model breakdown that recomputes its own
+  percentiles rather than averaging other percentiles.
+- **A Prometheus endpoint** for scrapers, spanning every tenant — gated by an
+  operator token rather than a tenant credential, and absent unless that token is
+  configured, because no role in the system means "may read other customers' data."
+
+### Synthetic data generation
+
+A standalone module that turns a production database into a privacy-safe synthetic
+copy that is **structurally usable** — not just statistically plausible.
+
+- **Understands the schema before generating anything**: keys, constraints,
+  nullability, and *measured* relationship cardinality, then a dependency graph that
+  decides generation order so parents exist before their children.
+- **Joins actually work.** Foreign keys are remapped from the parent's real
+  generated key pool, so a child can only reference a key that exists. Cycles and
+  self-references are handled rather than crashed on.
+- **The generative model is a pluggable port**, and each engine *declares* what it
+  preserves. The default engine needs zero dependencies; an RCTGAN adapter slots in
+  behind the same interface.
+- **A four-layer validation report** — statistical (KS / PSI), structural, privacy,
+  and data quality — whose verdict is "zero critical failures", never an aggregate
+  score that could average a privacy leak into a comfortable 94%.
+- **Privacy is measured, not asserted**: k-anonymity-aware leakage detection and
+  distance-to-closest-record against the real data's own spacing. Tested
+  adversarially — a memorizing engine must fail it, and does.
+
+See [the synthetic package README](src/modelrouter/synthetic/README.md) for the
+five-stage architecture and the honest scope list.
+
+### Deciding which model to actually use
+
+- **Side-by-side comparison** — one prompt, up to 8 models, every answer returned
+  with its own real cost, latency, and optional score. It reports the *cheapest
+  passing* candidate, not merely the cheapest: "which model earns its cost."
+- **Replay** — opt-in, encrypted, short-TTL payload capture so a real production
+  request can be re-run against several models later. Off by default and expiry is
+  enforced on read, so retention never depends on a cleanup job having run.
+- **Tool-call repair for weak models** — small models are markedly worse at tool
+  calling than at prose. Arguments that are double-encoded, fenced, or buried in
+  prose are repaired; hallucinated tool names and missing required parameters are
+  *reported, never invented*, because fabricating an argument to a function that is
+  about to be executed is worse than failing.
 
 ### Getting smarter over time
 - **Evaluation** — golden-set test cases scored by exact match, regex, JSON
@@ -248,9 +324,48 @@ cp .env.example .env
 | Variable | Purpose |
 |---|---|
 | `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GROQ_API_KEY`, `TOGETHER_API_KEY`, ... | Provider credentials — set only what you use. A local Ollama server needs none at all, and any new OpenAI-wire-compatible host works from an env var alone, no code change. |
-| `MODELROUTER_STORAGE` | `memory` (default — zero infrastructure) or `sqlite` (durable across restarts). |
+| `MODELROUTER_STORAGE` | `memory` (default — zero infrastructure), `sqlite` (durable, single process), `redis` (shared across replicas), or `postgres` (durable *and* shared across replicas). One switch for every storage-backed subsystem — accounting, traces, evals, closed-loop, evidence, tenancy. |
 | `MODELROUTER_KEY_HASH_SECRET` | Optional secret used to hash API keys at rest. |
 | `MODELROUTER_BOOTSTRAP_CREDIT_USD` | Starting credit granted to the auto-created tenant on first run (default $20). |
+| `MODELROUTER_BYOK_MASTER_KEY` | Required before storing any tenant's own provider key — see [Production deployment](#production-deployment) below. |
+
+### Production deployment
+
+The storage tier above is Law 1 in practice: **zero-infra by default, an
+opt-in upgrade, never a rewrite** — the same `ModelRouter`/`AccountingService`/
+`TraceService` code runs unchanged against any of the four backends.
+
+- **Redis** (`store/redis_events.py`) — a shared, replica-safe event log via
+  Redis Streams, plus a separate atomic reservation ledger
+  (`accounting/ledger.py`, Lua-scripted) that turns the budget hard-floor
+  check from a single-process guarantee into a cross-replica one — the fix
+  the product-vision doc's own 1000+ req/sec sizing math depends on.
+- **Postgres** (`store/postgres_events.py`) — the durable system of record
+  underneath Redis's hot path; connection-pooled, parameterized queries only.
+- **BYOK** (`tenancy/byok.py`) — Fernet envelope encryption locally, or AWS
+  KMS-sealed (`resolve_kms_sealed_key()`) in production; a tenant's own key
+  is never logged, never stored in plaintext, and never touches an adapter
+  shared with any other tenant.
+- **Async trace publishing** (`observability/async_publish.py`) — an
+  optional, best-effort fan-out of every recorded trace to Kafka or SQS for
+  external consumers, on top of (never instead of) the durable write.
+
+`docker-compose.yml` brings up Redis, Postgres, a Kafka-wire-compatible
+broker, and a local AWS emulator (SQS/KMS) in one command — everything above
+is exercisable on a laptop with no cloud account:
+
+```bash
+docker compose up -d
+pip install -e ".[all]"
+MODELROUTER_STORAGE=postgres MODELROUTER_POSTGRES_DSN=postgresql://modelrouter:modelrouter@localhost:5432/modelrouter \
+  python -m modelrouter serve
+```
+
+`infra/terraform/` maps every one of those local containers to its real AWS
+equivalent (ElastiCache, Aurora Serverless v2, MSK, KMS, SQS) plus an ECS
+Fargate service autoscaled on request concurrency — the direct, checked-in
+answer to "what does this look like in production," not a claim that it has
+been run at that scale.
 
 ### Run it as a server
 
@@ -310,6 +425,16 @@ print(metadata.served_by)   # which model actually answered
 | `POST /v1/images`, `/v1/speech`, `/v1/transcriptions` | Native | Same fallback/retry/billing pipeline as chat |
 | `GET /v1/usage` | Native | The caller's tenant credit balance |
 | `GET /v1/traces`, `GET /v1/traces/{request_id}` | Native | Durable request traces, tenant-scoped, full fan-out tree |
+| `GET /v1/metrics` | Native | The caller's own aggregated metrics — counts, error rate, p50/p95/p99, cost, per-model breakdown |
+| `GET /metrics` | Prometheus | Operator-only exposition format; token-gated, 404 unless configured |
+| `POST /v1/compare` | Native | One prompt → N models, side by side with cost/latency/score |
+| `POST /v1/replay/{request_id}` | Native | Re-run a captured request against N models |
+| `POST /v1/synthetic/generate`, `GET /v1/synthetic/runs/{id}/report` | Native | Synthetic data generation + its validation report |
+| `POST /v1/orgs` | Native | Register an organization — creates its first owner and a default workspace |
+| `GET /v1/orgs/me`, `…/members`, `…/invitations`, `…/domains` | Native | Organization management, permission-gated |
+| `GET POST /v1/workspaces`, `…/{id}/projects` | Native | Workspace and project management |
+| `POST /v1/invitations/accept` | Native | Redeem an invitation (requires a signed-in user) |
+| `GET /auth/sso/login`, `/auth/sso/callback`, `/auth/sso/me` | Native | Single sign-on (only when SSO is configured) |
 | `GET /v1/models`, `GET /v1/providers` | Discovery | No auth required |
 | `GET /health` | — | Liveness |
 
@@ -318,11 +443,27 @@ per-tenant key, resolved in O(1), never a shared secret.
 
 ## Testing
 
-502 tests, zero real network calls — every provider is faked or mocked, so the full
-suite runs offline in seconds.
+986 tests, zero real network calls — every provider, identity provider, broker, and
+datastore is faked, so the full suite runs offline in seconds.
 
 ```bash
 python -m pytest
+```
+
+Some tests are gated behind optional dependencies (`redis`, `psycopg`, `boto3`,
+`aiokafka`, `cryptography`, `fastapi`, `jsonschema`) and skip cleanly rather than
+fail when absent. Two honest notes about what that means:
+
+- The Redis/Postgres/ledger modules **are** proven for real, against hand-rolled
+  fakes that reimplement their exact Lua-script and SQL logic in plain Python —
+  not merely syntax-checked. The one thing those fakes can't prove is that the
+  Lua/SQL text itself is valid, which needs a live server once
+  (`docker compose up`).
+- The HTTP layer's 34 end-to-end tests need `fastapi`. Install the server extra
+  to execute them:
+
+```bash
+pip install -e ".[server]" && python -m pytest tests/test_identity_http.py
 ```
 
 ## What's next
@@ -331,3 +472,33 @@ Semantic caching (catching near-duplicate prompts via embedding similarity — n
 an embeddings capability this project doesn't have yet, a real dependency decision
 rather than a design gap), a read-only dashboard over the trace/spend data that
 already exists, and support for Codex's Responses API.
+
+Honestly-scoped gaps in what's already built, named rather than implied:
+
+- **BYOK covers the chat path only** — image/speech/transcription calls still use
+  the operator's shared adapter, not a resolved per-tenant one.
+- **The Redis reservation ledger has one documented crash window**: a process
+  dying between the ledger's atomic hold and the matching event-log write leaks
+  that hold until a periodic reconciliation job (not built) replays the log.
+- **Identity/SSO have no Postgres or Redis tier yet**, and their factories fail
+  loudly rather than falling through to SQLite when one is configured. Postgres
+  Row-Level Security is designed for but needs that tier first.
+- **SSO back-channel logout returns 501** — it will not act on a logout token it
+  cannot yet signature-verify, since doing so would let anyone log anyone out.
+  **SCIM** deprovisioning and **SAML** are likewise not built.
+- **The chat endpoints authenticate but don't yet check `route:invoke`**, so a
+  `viewer` session reaches them. A test pins that behavior so closing it is a
+  visible decision, not silent drift.
+- **Observability exports Prometheus text but not OTel spans.** Metrics are
+  aggregated and scrapeable; distributed-tracing export over OTLP is not built —
+  the internal trace log is the data model it would export.
+- **`EvaluationService` still has no HTTP surface.** Golden sets and scoring are
+  usable from Python and now via `/v1/compare` for ad-hoc comparisons, but
+  managing a stored golden set over HTTP is not built.
+- **The prompt-cache warm map is in-memory**, so with several replicas each one
+  learns warmth independently. Correct on a single replica, merely suboptimal
+  across many (it never routes *wrongly* — it just misses a cache it can't see).
+- **The closed-loop scorer has no scheduler.** `ClosedLoopService` is real and
+  tested but nothing runs it periodically; that worker is not built.
+
+Full detail on each: [the identity package README](src/modelrouter/identity/README.md).

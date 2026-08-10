@@ -209,6 +209,139 @@ class ContractViolationError(ModelRouterError):
         super().__init__(f"response violated its JSON Schema contract: {summary}{more}")
 
 
+class IdentityError(ModelRouterError):
+    """Base for `identity/`'s own typed failures — org/workspace/project
+    membership, invitations, domains. Grouped under one parent so an HTTP layer
+    can map the whole family without enumerating every subclass, while each
+    subclass still carries the specific fields a caller needs to render a
+    useful message."""
+
+
+class EmailAlreadyRegisteredError(IdentityError):
+    def __init__(self, email: str):
+        self.email = email
+        super().__init__(f"a user already exists with email {email!r}")
+
+
+class UserNotFoundError(IdentityError):
+    def __init__(self, user_id: str):
+        self.user_id = user_id
+        super().__init__(f"no user with id {user_id!r}")
+
+
+class SlugConflictError(IdentityError):
+    def __init__(self, kind: str, slug: str):
+        self.kind = kind
+        self.slug = slug
+        super().__init__(f"a live {kind} with slug {slug!r} already exists in this tenant")
+
+
+class WorkspaceNotFoundError(IdentityError):
+    def __init__(self, workspace_id: str):
+        self.workspace_id = workspace_id
+        super().__init__(f"no live workspace with id {workspace_id!r} in this tenant")
+
+
+class ProjectNotFoundError(IdentityError):
+    def __init__(self, project_id: str):
+        self.project_id = project_id
+        super().__init__(f"no live project with id {project_id!r} in this tenant")
+
+
+class AlreadyMemberError(IdentityError):
+    def __init__(self, user_id: str):
+        self.user_id = user_id
+        super().__init__(f"user {user_id!r} is already a member")
+
+
+class NotAMemberError(IdentityError):
+    def __init__(self, user_id: str):
+        self.user_id = user_id
+        super().__init__(f"user {user_id!r} is not an active member of this tenant")
+
+
+class LastOwnerError(IdentityError):
+    """Refuses to remove or demote the final owner of an org.
+
+    Enforced because the alternative is an orphaned organization: nobody can
+    invite anyone, change billing, or configure SSO, and the only recovery is
+    an out-of-band support intervention. Every mature B2B product has a
+    documented recovery process for this precisely because they didn't block it
+    up front."""
+
+    def __init__(self, tenant_id: str):
+        self.tenant_id = tenant_id
+        super().__init__(
+            f"tenant {tenant_id!r} would be left with no owner; "
+            f"promote another member to owner first"
+        )
+
+
+class RoleEscalationError(IdentityError):
+    """A principal tried to grant a role outranking their own — the
+    invitation/role-change privilege-escalation path. Checked at BOTH grant
+    time and acceptance time, because the granter may have been demoted in
+    between."""
+
+    def __init__(self, granter_role: str, granted_role: str):
+        self.granter_role = granter_role
+        self.granted_role = granted_role
+        super().__init__(
+            f"a {granter_role!r} cannot grant the higher role {granted_role!r}"
+        )
+
+
+class InvitationInvalidError(IdentityError):
+    """One error type for every "this invitation can't be used" case —
+    unknown token, expired, already accepted, revoked.
+
+    Deliberately NOT distinguished in the message. Telling an unauthenticated
+    caller "that token existed but expired" versus "that token never existed"
+    is an oracle for probing valid tokens, and the recipient's next action is
+    identical in every case: ask for a fresh invitation."""
+
+    def __init__(self, reason: str):
+        self.reason = reason        # for OUR logs, never for the HTTP response body
+        super().__init__("this invitation link is not valid; request a new one")
+
+
+class StorageUnavailableError(ModelRouterError):
+    """Raised by a storage backend (`store/redis_events.py`,
+    `store/postgres_events.py`, `accounting/ledger.py`) when the underlying
+    infrastructure is unreachable AFTER that client's own configured retries
+    have already been exhausted — a genuinely down dependency, not a
+    transient blip (the blips are handled inside redis-py's `Retry` and
+    psycopg_pool's reconnect logic, which is where retry belongs; see
+    `agents.md` #6).
+
+    **Why this is a distinct type, and why it must stay loud.** Every caller
+    of an `EventStore` in this codebase is recording something that already
+    happened (money settled, a trace completed) or checking a hard budget
+    floor. Neither has a safe default: silently swallowing a failed
+    `append()` would lose money/audit data, and silently allowing a
+    reservation whose ledger check couldn't run would break the "overspend is
+    mathematically impossible" guarantee outright. So storage failures
+    FAIL CLOSED — this propagates, and `router.py`'s top-level guard turns it
+    into a real error for the caller, rather than a request that quietly
+    proceeded unbilled.
+
+    The ONE deliberate exception is `observability/async_publish.py`'s
+    best-effort trace publishing, which is a side channel with a durable
+    write already committed behind it — that one swallows, and says so.
+
+    `backend` names which tier failed ("redis"/"postgres"), so an operator
+    reading the message knows which dependency to go look at."""
+
+    def __init__(self, backend: str, operation: str, original: Exception):
+        self.backend = backend
+        self.operation = operation
+        self.original = original
+        super().__init__(
+            f"{backend} storage is unavailable during {operation!r} "
+            f"(after the client's own retries): {type(original).__name__}: {original}"
+        )
+
+
 class InternalError(ModelRouterError):
     """Raised by router.py's top-level guard around chat()/generate_image()/
     speech()/transcribe() when something INSIDE ModelRouter's own control flow
