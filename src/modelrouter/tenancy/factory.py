@@ -19,14 +19,16 @@ import os
 from modelrouter.core.errors import ConfigError
 from modelrouter.store.db import SqliteDatabase
 from modelrouter.store.factory import DEFAULT_SQLITE_PATH, resolve_backend
+from modelrouter.store.postgres_events import create_postgres_pool
 from modelrouter.tenancy.memory import InMemoryTenancyRepo
 from modelrouter.tenancy.ports import TenancyRepo
 from modelrouter.tenancy.sqlite_repo import SqliteTenancyRepo
 
-_SUPPORTED_BACKENDS = frozenset({"memory", "sqlite"})
+_SUPPORTED_BACKENDS = frozenset({"memory", "sqlite", "postgres"})
 
 
-def create_tenancy_repo(backend: str | None = None, *, sqlite_path: str | None = None) -> TenancyRepo:
+def create_tenancy_repo(backend: str | None = None, *, sqlite_path: str | None = None,
+                        postgres_dsn: str | None = None) -> TenancyRepo:
     resolved = resolve_backend(backend)
     if resolved not in _SUPPORTED_BACKENDS:
         raise ConfigError(
@@ -35,5 +37,12 @@ def create_tenancy_repo(backend: str | None = None, *, sqlite_path: str | None =
         )
     if resolved == "memory":
         return InMemoryTenancyRepo()
+    if resolved == "postgres":
+        from modelrouter.tenancy.postgres_repo import PostgresTenancyRepo
+
+        dsn = postgres_dsn or os.environ.get("MODELROUTER_POSTGRES_DSN")
+        if not dsn:
+            raise ConfigError("MODELROUTER_STORAGE=postgres requires MODELROUTER_POSTGRES_DSN to be set")
+        return PostgresTenancyRepo(create_postgres_pool(dsn))
     path = sqlite_path or os.environ.get("MODELROUTER_SQLITE_PATH") or DEFAULT_SQLITE_PATH
     return SqliteTenancyRepo(SqliteDatabase(path))

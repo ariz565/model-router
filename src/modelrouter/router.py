@@ -224,6 +224,7 @@ class ModelRouter:
         traces: TraceService | None = None,
         prompt_cache: PromptCacheTracker | None = None,
         credential_vault: CredentialVault | None = None,
+        latency=None,
     ):
         self._adapters = adapters
         self._retry_policy = retry_policy or RetryPolicy()
@@ -246,6 +247,7 @@ class ModelRouter:
         self._prompt_cache = prompt_cache
         self._broadcaster = broadcaster
         self._credential_vault = credential_vault
+        self._latency = latency
 
     def _resolve_adapter(self, provider_name: str, tenant_id: str | None) -> ProviderPort | None:
         """The one seam every dispatch site below calls through instead of
@@ -1138,7 +1140,9 @@ class ModelRouter:
         if not endpoints or self._provider_router is None:
             return [Endpoint.bare(model_spec)]
         filtered = self._provider_router.filter_endpoints(endpoints, self._provider_routing_config)
-        ordered = self._provider_router.select_order(filtered, self._provider_routing_config, health=self._health)
+        ordered = self._provider_router.select_order(
+            filtered, self._provider_routing_config, health=self._health, latency=self._latency,
+        )
         ordered = ordered or [Endpoint.bare(model_spec)]
         if self._prompt_cache is not None and prefix_hash is not None:
             ordered = self._prompt_cache.prefer_warm(ordered, prefix_hash)
@@ -1436,10 +1440,13 @@ class ModelRouter:
             return resp
 
         try:
+            started = time.monotonic()
             response = await retry_async(
                 _one_call, policy=self._retry_policy,
                 label=f"{adapter.name}:{model_name}", on_attempt=on_attempt,
             )
+            if self._latency is not None:
+                self._latency.record(f"{adapter.name}:{model_name}", time.monotonic() - started)
             return response, attempts
         except Exception:
             return None, attempts

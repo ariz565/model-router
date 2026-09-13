@@ -46,6 +46,7 @@ import threading
 from typing import Protocol, runtime_checkable
 
 from modelrouter.core.errors import ConfigError
+from modelrouter.store.postgres_events import create_postgres_pool, postgres_errors
 
 
 @runtime_checkable
@@ -208,6 +209,48 @@ class SqliteCredentialVault:
             self._conn.commit()
 
 
+class PostgresCredentialVault:
+    def __init__(self, fernet_key: bytes, dsn: str):
+        from cryptography.fernet import Fernet
+
+        self._fernet = Fernet(fernet_key)
+        self._pool = create_postgres_pool(dsn)
+        with postgres_errors("byok_schema_bootstrap"):
+            with self._pool.connection() as conn:
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS byok_credentials (tenant_id TEXT NOT NULL, provider TEXT NOT NULL, "
+                    "ciphertext BYTEA NOT NULL, PRIMARY KEY (tenant_id, provider))"
+                )
+                conn.commit()
+
+    def store_key(self, tenant_id: str, provider: str, api_key: str) -> None:
+        _validate_identifiers(tenant_id, provider)
+        ciphertext = self._fernet.encrypt(api_key.encode())
+        with postgres_errors("store_byok_key"):
+            with self._pool.connection() as conn:
+                conn.execute(
+                    "INSERT INTO byok_credentials (tenant_id, provider, ciphertext) VALUES (%s, %s, %s) "
+                    "ON CONFLICT (tenant_id, provider) DO UPDATE SET ciphertext = EXCLUDED.ciphertext",
+                    (tenant_id, provider, ciphertext),
+                )
+                conn.commit()
+
+    def resolve_key(self, tenant_id: str, provider: str) -> str | None:
+        with postgres_errors("resolve_byok_key"):
+            with self._pool.connection() as conn:
+                row = conn.execute(
+                    "SELECT ciphertext FROM byok_credentials WHERE tenant_id = %s AND provider = %s",
+                    (tenant_id, provider),
+                ).fetchone()
+        return self._fernet.decrypt(bytes(row[0])).decode() if row else None
+
+    def revoke_key(self, tenant_id: str, provider: str) -> None:
+        with postgres_errors("revoke_byok_key"):
+            with self._pool.connection() as conn:
+                conn.execute("DELETE FROM byok_credentials WHERE tenant_id = %s AND provider = %s", (tenant_id, provider))
+                conn.commit()
+
+
 def create_credential_vault(backend: str | None = None, *, sqlite_path: str | None = None) -> CredentialVault:
     """Reads the SAME `MODELROUTER_STORAGE` env var `store/factory.py`'s
     `create_event_store()` reads (Law 1: one env var switches every
@@ -223,7 +266,7 @@ def create_credential_vault(backend: str | None = None, *, sqlite_path: str | No
     from modelrouter.store.factory import DEFAULT_SQLITE_PATH, resolve_backend
 
     resolved = resolve_backend(backend)
-    if resolved not in ("memory", "sqlite"):
+    if resolved not in ("memory", "sqlite", "postgres"):
         raise ConfigError(
             f"MODELROUTER_STORAGE={resolved!r} has no CredentialVault implementation yet; "
             f"expected one of ['memory', 'sqlite']"
@@ -231,6 +274,11 @@ def create_credential_vault(backend: str | None = None, *, sqlite_path: str | No
     fernet_key = resolve_local_key()
     if resolved == "memory":
         return InMemoryCredentialVault(fernet_key)
+    if resolved == "postgres":
+        dsn = os.environ.get("MODELROUTER_POSTGRES_DSN")
+        if not dsn:
+            raise ConfigError("MODELROUTER_STORAGE=postgres requires MODELROUTER_POSTGRES_DSN to be set")
+        return PostgresCredentialVault(fernet_key, dsn)
     path = sqlite_path or os.environ.get("MODELROUTER_SQLITE_PATH") or DEFAULT_SQLITE_PATH
     SqliteDatabase(path).close()   # validates the path/permissions early, same failure mode as every other tier
     return SqliteCredentialVault(fernet_key, path)

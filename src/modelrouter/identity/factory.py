@@ -26,12 +26,14 @@ from modelrouter.identity.memory import InMemoryIdentityRepo
 from modelrouter.identity.ports import IdentityRepo
 from modelrouter.store.db import SqliteDatabase
 from modelrouter.store.factory import DEFAULT_SQLITE_PATH, resolve_backend
+from modelrouter.store.postgres_db import PostgresDatabase
+from modelrouter.store.postgres_events import create_postgres_pool
 
-_SUPPORTED_BACKENDS = frozenset({"memory", "sqlite"})
+_SUPPORTED_BACKENDS = frozenset({"memory", "sqlite", "postgres"})
 
 
 def create_identity_stack(
-    backend: str | None = None, *, sqlite_path: str | None = None,
+    backend: str | None = None, *, sqlite_path: str | None = None, postgres_dsn: str | None = None,
 ) -> tuple[IdentityRepo, AuditLog]:
     """Returns `(identity_repo, audit_log)` — always both, never one without
     the other. A membership store with no audit trail is a compliance gap that
@@ -44,6 +46,15 @@ def create_identity_stack(
         )
     if resolved == "memory":
         return InMemoryIdentityRepo(), InMemoryAuditLog()
+
+    if resolved == "postgres":
+        from modelrouter.identity.sqlite_repo import SqliteAuditLog, SqliteIdentityRepo
+
+        dsn = postgres_dsn or os.environ.get("MODELROUTER_POSTGRES_DSN")
+        if not dsn:
+            raise ConfigError("MODELROUTER_STORAGE=postgres requires MODELROUTER_POSTGRES_DSN to be set")
+        db = PostgresDatabase(create_postgres_pool(dsn))
+        return SqliteIdentityRepo(db), SqliteAuditLog(db)
 
     from modelrouter.identity.sqlite_repo import SqliteAuditLog, SqliteIdentityRepo
 

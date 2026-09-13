@@ -237,6 +237,13 @@ def test_factory_explicit_backend_overrides_env(monkeypatch):
     assert isinstance(create_tenancy_repo(backend="memory"), InMemoryTenancyRepo)
 
 
+def test_postgres_factory_requires_a_dsn(monkeypatch):
+    monkeypatch.setenv("MODELROUTER_STORAGE", "postgres")
+    monkeypatch.delenv("MODELROUTER_POSTGRES_DSN", raising=False)
+    with pytest.raises(ConfigError, match="MODELROUTER_POSTGRES_DSN"):
+        create_tenancy_repo()
+
+
 def test_factory_rejects_unknown_backend():
     with pytest.raises(ConfigError):
         create_tenancy_repo(backend="redis")

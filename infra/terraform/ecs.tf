@@ -67,8 +67,8 @@ resource "aws_ecs_task_definition" "app" {
     portMappings = [{ containerPort = 8000, protocol = "tcp" }]
     environment = [
       { name = "MODELROUTER_STORAGE", value = "postgres" },
-      { name = "MODELROUTER_REDIS_URL", value = "redis://${aws_elasticache_replication_group.this.primary_endpoint_address}:6379/0" },
-      { name = "MODELROUTER_TRACE_KAFKA_BOOTSTRAP_SERVERS", value = aws_msk_cluster.this.bootstrap_brokers_tls },
+      { name = "MODELROUTER_REDIS_URL", value = "rediss://${aws_elasticache_replication_group.this.primary_endpoint_address}:6379/0" },
+      { name = "MODELROUTER_REDIS_LEDGER_URL", value = "rediss://${aws_elasticache_replication_group.this.primary_endpoint_address}:6379/1" },
       { name = "MODELROUTER_TRACE_SQS_QUEUE_URL", value = aws_sqs_queue.traces.url },
       { name = "MODELROUTER_BYOK_KMS_KEY_ID", value = aws_kms_key.byok.key_id },
       { name = "AWS_REGION", value = data.aws_region.current.name },

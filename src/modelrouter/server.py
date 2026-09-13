@@ -41,7 +41,7 @@ from datetime import datetime, timezone
 from typing import Annotated, Literal
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Response
-from fastapi.responses import PlainTextResponse, StreamingResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -50,6 +50,9 @@ from modelrouter.observability import TraceService, create_trace_service
 from modelrouter.config import KNOWN_PROVIDER_ENV_VARS, Settings
 from modelrouter.core.errors import format_error_message
 from modelrouter.pipeline.compression import estimate_tokens
+from modelrouter.pipeline.rate_limit import RateLimitExceededError, RateLimitPolicy, RedisRateLimiter
+from modelrouter.pipeline.shared_state import RedisHealthTracker, RedisLatencyTracker, RedisPromptCacheTracker
+from modelrouter.store.redis_client import create_redis_client
 from modelrouter.core.types import (
     ChatResponse,
     ImageGenerationRequest,
@@ -69,6 +72,7 @@ from modelrouter.providers.adapters import (
 from modelrouter.registry import ModelRegistry, example_registry
 from modelrouter.router import ModelRouter
 from modelrouter.tenancy import ApiKey, TenancyRepo, create_tenancy_repo
+from modelrouter.tenancy.byok import create_credential_vault
 from modelrouter.identity.authz import (
     AuthzContext,
     PermissionDeniedError,
@@ -89,6 +93,8 @@ from modelrouter.observability.replay import (
     InMemoryReplayStore,
     ReplayStore,
 )
+from modelrouter.observability.async_publish import KafkaTracePublisher, SqsTracePublisher
+from modelrouter.operations import RecurringJob, RecurringJobRunner
 
 _api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
 
@@ -105,6 +111,8 @@ _AUTH_FAILED_DETAIL = "missing or invalid credentials"
 # The Prometheus endpoint spans every tenant, so it authenticates as
 # infrastructure rather than as a tenant. Unset ⇒ the route 404s (fail closed).
 METRICS_TOKEN_ENV_VAR = "MODELROUTER_METRICS_TOKEN"
+MAX_REQUEST_BYTES_ENV_VAR = "MODELROUTER_MAX_REQUEST_BYTES"
+DEFAULT_MAX_REQUEST_BYTES = 10 * 1024 * 1024
 
 
 async def require_principal(
@@ -134,12 +142,31 @@ async def require_principal(
         if api_key is None:
             raise HTTPException(status_code=401, detail=_AUTH_FAILED_DETAIL)
         tenancy_repo.touch_api_key(api_key.key_id)
-        return api_key_principal(api_key)
+        principal = api_key_principal(api_key)
+        _acquire_rate_limit(request, principal)
+        return principal
 
     session_principal_result = _principal_from_session_cookie(request)
     if session_principal_result is not None:
+        _acquire_rate_limit(request, session_principal_result)
         return session_principal_result
     raise HTTPException(status_code=401, detail=_AUTH_FAILED_DETAIL)
+
+
+def _acquire_rate_limit(request: Request, principal: Principal) -> None:
+    limiter = getattr(request.app.state, "rate_limiter", None)
+    if limiter is None:
+        return
+    try:
+        limiter.acquire("tenant", principal.tenant_id)
+    except RateLimitExceededError as error:
+        raise HTTPException(status_code=429, detail="rate limit exceeded") from error
+    try:
+        limiter.acquire(principal.kind, principal.subject_id)
+    except RateLimitExceededError as error:
+        limiter.release("tenant", principal.tenant_id)
+        raise HTTPException(status_code=429, detail="rate limit exceeded") from error
+    request.state.rate_limit_scopes = (("tenant", principal.tenant_id), (principal.kind, principal.subject_id))
 
 
 def _principal_from_session_cookie(request: Request) -> Principal | None:
@@ -252,6 +279,45 @@ def _optional_replay_key() -> bytes | None:
     return key.encode()
 
 
+def _create_trace_publisher():
+    sqs_queue_url = os.environ.get("MODELROUTER_TRACE_SQS_QUEUE_URL")
+    kafka_bootstrap_servers = os.environ.get("MODELROUTER_TRACE_KAFKA_BOOTSTRAP_SERVERS")
+    if sqs_queue_url and kafka_bootstrap_servers:
+        raise RuntimeError("configure either MODELROUTER_TRACE_SQS_QUEUE_URL or MODELROUTER_TRACE_KAFKA_BOOTSTRAP_SERVERS")
+    if sqs_queue_url:
+        return SqsTracePublisher(sqs_queue_url)
+    if kafka_bootstrap_servers:
+        topic = os.environ.get("MODELROUTER_TRACE_KAFKA_TOPIC", "modelrouter.traces")
+        return KafkaTracePublisher(topic, bootstrap_servers=kafka_bootstrap_servers)
+    return None
+
+
+def _create_rate_limiter() -> RedisRateLimiter | None:
+    url = os.environ.get("MODELROUTER_RATE_LIMIT_REDIS_URL")
+    if not url:
+        return None
+    return RedisRateLimiter.from_url(
+        url,
+        RateLimitPolicy(
+            requests_per_minute=int(os.environ.get("MODELROUTER_RATE_LIMIT_RPM", "600")),
+            tokens_per_minute=int(os.environ.get("MODELROUTER_RATE_LIMIT_TPM", "100000")),
+            concurrent_requests=int(os.environ.get("MODELROUTER_RATE_LIMIT_CONCURRENT", "50")),
+        ),
+    )
+
+
+def _create_routing_state():
+    url = os.environ.get("MODELROUTER_ROUTING_REDIS_URL")
+    if not url:
+        return None, None, None
+    client = create_redis_client(url)
+    return (
+        RedisHealthTracker(client, failure_threshold=int(os.environ.get("MODELROUTER_CIRCUIT_FAILURE_THRESHOLD", "1"))),
+        RedisPromptCacheTracker(client),
+        RedisLatencyTracker(client),
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Constructs every subsystem, in dependency order, then tears down what
@@ -275,7 +341,12 @@ async def lifespan(app: FastAPI):
 
     tenancy_repo = create_tenancy_repo()
     accounting_service = create_accounting_service()
-    trace_service = create_trace_service()
+    trace_publisher = _create_trace_publisher()
+    if trace_publisher is not None:
+        starter = getattr(trace_publisher, "start", None)
+        if starter is not None:
+            await starter()
+    trace_service = create_trace_service(publisher=trace_publisher)
     identity_repo, audit_log = create_identity_stack()
     # [Illustrative data — see registry/example_data.py's own docstring] A
     # real deployment populates ModelRegistry from an actual pricing feed;
@@ -287,6 +358,7 @@ async def lifespan(app: FastAPI):
     app.state.accounting = accounting_service
     app.state.traces = trace_service
     app.state.identity = identity_repo
+    app.state.rate_limiter = _create_rate_limiter()
     app.state.audit = audit_log
     # Aggregation reads the trace log; it holds no state of its own, so there is
     # no second source of truth to keep in sync (see metrics.py).
@@ -298,11 +370,18 @@ async def lifespan(app: FastAPI):
     app.state.replay = InMemoryReplayStore(_optional_replay_key())
     app.state.identity_service = IdentityService(identity_repo, tenancy_repo, audit_log)
     app.state.registry = registry
+    credential_vault = create_credential_vault() if os.environ.get("MODELROUTER_BYOK_MASTER_KEY") else None
+    health, prompt_cache, latency = _create_routing_state()
     app.state.router = ModelRouter(
         adapters, accounting=accounting_service, price_lookup=registry.price_lookup(),
         max_output_tokens_lookup=registry.max_output_tokens_lookup(), traces=trace_service,
+        credential_vault=credential_vault, health=health, prompt_cache=prompt_cache, latency=latency,
     )
     app.state.settings = settings
+    app.state.jobs = RecurringJobRunner([
+        RecurringJob("purge_replay", 3600, lambda: app.state.replay.purge_expired(before=datetime.now(timezone.utc))),
+    ])
+    await app.state.jobs.start()
 
     # ── Optional: SSO. Absent unless configured; see the docstring above. ──
     app.state.sso = create_sso_service(identity_repo)
@@ -317,6 +396,7 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        await app.state.jobs.stop()
         # Shutdown, in reverse construction order. Each step is independently
         # guarded so one subsystem failing to close cannot skip the others —
         # otherwise a single bad close leaks everything after it.
@@ -353,6 +433,35 @@ app = FastAPI(
     description="Multi-provider LLM gateway — chat, image, speech, transcription, all through one API.",
     lifespan=lifespan,
 )
+
+
+@app.middleware("http")
+async def reject_oversized_requests(request: Request, call_next):
+    content_length = request.headers.get("content-length")
+    if content_length is None:
+        try:
+            return await call_next(request)
+        finally:
+            _release_rate_limit(request)
+    try:
+        received_bytes = int(content_length)
+    except ValueError:
+        return JSONResponse(status_code=400, content={"detail": "invalid Content-Length header"})
+    maximum_bytes = int(os.environ.get(MAX_REQUEST_BYTES_ENV_VAR, DEFAULT_MAX_REQUEST_BYTES))
+    if received_bytes > maximum_bytes:
+        return JSONResponse(status_code=413, content={"detail": "request body exceeds configured limit"})
+    try:
+        return await call_next(request)
+    finally:
+        _release_rate_limit(request)
+
+
+def _release_rate_limit(request: Request) -> None:
+    limiter = getattr(request.app.state, "rate_limiter", None)
+    scopes = getattr(request.state, "rate_limit_scopes", ())
+    if limiter is not None:
+        for scope, identifier in scopes:
+            limiter.release(scope, identifier)
 
 # ── Identity: org/workspace/project/member/invitation management ──────────
 #
@@ -959,6 +1068,16 @@ class OpenAIChatCompletionRequest(BaseModel):
     contract_policy: Literal["fail", "retry"] = "fail"   # NOT an OpenAI field -- our own additive extension
 
 
+class OpenAIResponsesRequest(BaseModel):
+    model: str
+    input: str | list[OpenAIChatMessage]
+    instructions: str | None = None
+    temperature: float = 1.0
+    max_output_tokens: int | None = None
+    tools: list[dict] | None = None
+    stream: bool = False
+
+
 def _resolve_compat_model(requested_model: str, registry: ModelRegistry) -> list[str]:
     """Part 3's "tolerant model-ID resolver," three tiers, checked in order:
     1. Exact match on our canonical `model_id`.
@@ -1145,6 +1264,39 @@ async def chat_completions(
             "completion_tokens": response.usage.completion_tokens,
             "total_tokens": response.usage.total_tokens,
         },
+    }
+
+
+@app.post("/v1/responses")
+async def responses(
+    body: OpenAIResponsesRequest, request: Request, principal: Annotated[Principal, Depends(require_principal)],
+):
+    if body.stream:
+        raise HTTPException(status_code=400, detail="streaming Responses is not available yet")
+    models = _resolve_compat_model(body.model, request.app.state.registry)
+    if not models:
+        raise _model_not_found(body.model)
+    messages = ([{"role": "user", "content": body.input}] if isinstance(body.input, str)
+                else [message.model_dump(exclude_none=True) for message in body.input])
+    if body.instructions:
+        messages.insert(0, {"role": "system", "content": body.instructions})
+    tenant = request.app.state.tenancy_repo.get_tenant(principal.tenant_id)
+    maximum = _effective_max_tokens(body.max_output_tokens, principal, tenant, request)
+    response, metadata = await _router(request).chat(
+        _ChatRequest(messages=messages, model=models[0].partition(":")[2], temperature=body.temperature,
+                     max_tokens=maximum, tools=body.tools, tags=_extract_tags(request),
+                     prompt_version=_extract_prompt_version(request), policy_version=_extract_policy_version(request)),
+        models=models, tenant_id=principal.tenant_id,
+    )
+    if response is None:
+        _raise_for_failed_chat(metadata)
+    choice = response.choices[0]
+    return {
+        "id": f"resp_{response.id}", "object": "response", "created_at": int(time.time()), "model": body.model,
+        "status": "completed", "output": [{"type": "message", "id": f"msg_{response.id}",
+        "status": "completed", "role": "assistant", "content": [{"type": "output_text",
+        "text": choice.message.get("content", "")}]}], "usage": {"input_tokens": response.usage.prompt_tokens,
+        "output_tokens": response.usage.completion_tokens, "total_tokens": response.usage.total_tokens},
     }
 
 
@@ -1732,6 +1884,16 @@ async def models(request: Request):
     }
 
 
+@app.get("/live")
+async def live():
+    return {"status": "ok"}
+
+
 @app.get("/health")
-async def health():
+@app.get("/ready")
+async def health(request: Request):
+    required_state = ("router", "tenancy_repo", "accounting", "traces", "identity")
+    missing = [name for name in required_state if not hasattr(request.app.state, name)]
+    if missing:
+        raise HTTPException(status_code=503, detail={"status": "not_ready", "missing": missing})
     return {"status": "ok"}

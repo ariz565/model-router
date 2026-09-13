@@ -25,8 +25,10 @@ from modelrouter.identity.sso.ports import SsoRepo
 from modelrouter.identity.sso.service import SsoService
 from modelrouter.store.db import SqliteDatabase
 from modelrouter.store.factory import DEFAULT_SQLITE_PATH, resolve_backend
+from modelrouter.store.postgres_db import PostgresDatabase
+from modelrouter.store.postgres_events import create_postgres_pool
 
-_SUPPORTED_BACKENDS = frozenset({"memory", "sqlite"})
+_SUPPORTED_BACKENDS = frozenset({"memory", "sqlite", "postgres"})
 
 __all__ = ["sso_is_enabled", "create_sso_repo", "create_sso_service", "resolve_redirect_uri"]
 
@@ -54,7 +56,8 @@ def resolve_redirect_uri() -> str:
     return value
 
 
-def create_sso_repo(backend: str | None = None, *, sqlite_path: str | None = None) -> SsoRepo:
+def create_sso_repo(backend: str | None = None, *, sqlite_path: str | None = None,
+                    postgres_dsn: str | None = None) -> SsoRepo:
     resolved = resolve_backend(backend)
     if resolved not in _SUPPORTED_BACKENDS:
         raise ConfigError(
@@ -63,6 +66,14 @@ def create_sso_repo(backend: str | None = None, *, sqlite_path: str | None = Non
         )
     if resolved == "memory":
         return InMemorySsoRepo()
+
+    if resolved == "postgres":
+        from modelrouter.identity.sso.sqlite_repo import SqliteSsoRepo
+
+        dsn = postgres_dsn or os.environ.get("MODELROUTER_POSTGRES_DSN")
+        if not dsn:
+            raise ConfigError("MODELROUTER_STORAGE=postgres requires MODELROUTER_POSTGRES_DSN to be set")
+        return SqliteSsoRepo(PostgresDatabase(create_postgres_pool(dsn)))
 
     from modelrouter.identity.sso.sqlite_repo import SqliteSsoRepo
 

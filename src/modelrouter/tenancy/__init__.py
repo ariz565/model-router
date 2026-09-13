@@ -23,10 +23,11 @@ from modelrouter.tenancy.keys import display_prefix, generate_plaintext_key, has
 from modelrouter.tenancy.memory import InMemoryTenancyRepo
 from modelrouter.tenancy.models import ApiKey, Tenant
 from modelrouter.tenancy.ports import TenancyRepo
+from modelrouter.tenancy.postgres_repo import PostgresTenancyRepo
 from modelrouter.tenancy.sqlite_repo import SqliteTenancyRepo
 
 __all__ = [
     "Tenant", "ApiKey", "TenancyRepo",
-    "InMemoryTenancyRepo", "SqliteTenancyRepo", "create_tenancy_repo",
+    "InMemoryTenancyRepo", "SqliteTenancyRepo", "PostgresTenancyRepo", "create_tenancy_repo",
     "generate_plaintext_key", "display_prefix", "hash_api_key",
 ]

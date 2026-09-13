@@ -104,7 +104,7 @@ class ProviderRouter:
 
     def select_order(
         self, endpoints: list[Endpoint], config: ProviderRoutingConfig,
-        *, health=None, rng: "random.Random | None" = None,
+        *, health=None, latency=None, rng: "random.Random | None" = None,
     ) -> list[Endpoint]:
         """Returns the try-order for THIS model's endpoints — the actual
         provider-level fallback chain router.py's Layer 2 (once wired to
@@ -123,6 +123,8 @@ class ProviderRouter:
 
         if config.sort == "price":
             return sorted(endpoints, key=lambda e: e.total_price)
+        if config.sort == "latency" and latency is not None:
+            return sorted(endpoints, key=lambda e: latency.latency(e.spec))
         if config.sort in ("throughput", "latency"):
             # No throughput/latency telemetry modeled in v0 — tool_call_reliability
             # is used as a placeholder ordering signal until real telemetry exists,
