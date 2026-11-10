@@ -7,10 +7,9 @@ two lines in `server.py`. Delete `synthetic/`, those lines, and the
 `identity/sso/` has, verified the same way.
 
 **Endpoints are tenant-scoped and permission-gated**, reusing `require_authz`
-rather than inventing an auth story. Synthetic data generation reads a customer's
-production schema, which is one of the most sensitive things this platform can be
-pointed at, so it sits behind `org:manage` (an OWNER-level permission) rather than
-a lesser one.
+rather than inventing an auth story. Generation uses the dedicated
+`synthetic:generate` permission; it never implies broader organization-management
+authority. Source registration remains an out-of-band operator action.
 
 **Runs are held in memory and are not durable.** Stated plainly because it is the
 main operational limitation: a restart loses run history. `TraceService`-style
@@ -149,7 +148,7 @@ async def list_sources(
 @router.post("/generate", status_code=201)
 async def generate(
     body: GenerateRequestBody, request: Request,
-    ctx: Annotated[AuthzContext, Depends(_require(Permission.ORG_MANAGE))],
+    ctx: Annotated[AuthzContext, Depends(_require(Permission.SYNTHETIC_GENERATE))],
 ):
     """Runs the full five-stage pipeline synchronously and returns the run record.
 

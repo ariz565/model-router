@@ -26,11 +26,15 @@ aws = ["boto3>=1.34"]              # SQS publisher + KMS-sealed BYOK vault (obse
 crypto = ["cryptography>=42.0"]    # BYOK credential vault envelope encryption (tenancy/byok.py)
 sso = ["authlib>=1.7", "joserfc>=1.0", "httpx>=0.27"]   # OIDC relying party (identity/sso/) -- joserfc, not authlib.jose, which upstream deprecated
 synthetic-rctgan = ["torch>=2.0", "ctgan>=0.10"]        # OPTIONAL engine for synthetic/. Large download; the default statistical engine needs nothing
+jev = ["httpx>=0.28,<1"]          # native pooled async transport for the standalone JEV module
+laya = ["laya>=0.3.4,<1"]         # open-weight Transformers/PyTorch Laya runtime
+laya-mlx = ["laya-mlx>=0.1,<1; platform_system == 'Darwin' and platform_machine == 'arm64'"]
 all = [
     "openai>=1.0", "anthropic>=0.39", "ollama>=0.3", "python-dotenv>=1.0",
-    "fastapi>=0.110", "uvicorn[standard]>=0.29", "python-multipart>=0.0.9",
+    "fastapi>=0.134,<0.142", "uvicorn[standard]>=0.30,<0.41", "python-multipart>=0.0.9,<0.1",
     "jsonschema>=4.0", "redis>=6.0", "psycopg[binary]>=3.1", "psycopg-pool>=3.1",
-    "aiokafka>=0.11", "boto3>=1.34", "cryptography>=42.0",
+    "aiokafka>=0.11", "boto3>=1.34", "cryptography>=42.0", "httpx>=0.28,<1",
+    "laya>=0.3.4,<1", "laya-mlx>=0.1,<1; platform_system == 'Darwin' and platform_machine == 'arm64'",
 ]
 dev = ["pytest>=8,<9", "httpx>=0.28,<1"]
 
@@ -45,3 +49,6 @@ where = ["src"]
 # editable install, and keep tests discoverable from the project root.
 pythonpath = ["src"]
 testpaths = ["tests"]
+markers = [
+    "integration: requires disposable external services; skipped unless MODELROUTER_INTEGRATION=1",
+]

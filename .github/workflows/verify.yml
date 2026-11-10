@@ -1,0 +1,84 @@
+name: verify
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install '.[all,dev]'
+      - run: python -m compileall -q src
+      - run: python -m pytest -q
+
+  dependency-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install --upgrade pip pip-audit
+      - run: python -m pip install '.[all]'
+      - run: python -m pip_audit
+
+  real-service-integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: modelrouter
+          POSTGRES_PASSWORD: modelrouter
+          POSTGRES_DB: modelrouter
+        ports: [5432:5432]
+        options: >-
+          --health-cmd "pg_isready -U modelrouter"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: [6379:6379]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      MODELROUTER_INTEGRATION: '1'
+      MODELROUTER_POSTGRES_DSN: postgresql://modelrouter:modelrouter@localhost:5432/modelrouter
+      MODELROUTER_REDIS_URL: redis://localhost:6379/0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install '.[postgres,redis,crypto,dev]'
+      - run: python -m pytest -q -m integration
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+
+  sbom:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: anchore/sbom-action@v0
+        with:
+          path: .
+          artifact-name: modelrouter-sbom.spdx.json

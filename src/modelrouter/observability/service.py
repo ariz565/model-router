@@ -83,6 +83,10 @@ class TraceService:
                 # `Broadcaster.broadcast()` already states for its own sinks.
                 pass
 
+    def healthcheck(self) -> None:
+        """Exercise durable trace storage; external publishing stays optional."""
+        self._store.last_seq(stream=OBSERVABILITY_STREAM)
+
     # ── Read ─────────────────────────────────────────────────────────────
 
     def get_trace(self, request_id: str) -> Trace | None:

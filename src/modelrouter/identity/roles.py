@@ -86,6 +86,7 @@ class Permission:
     AUDIT_READ = "audit:read"
 
     ROUTE_INVOKE = "route:invoke"       # actually send a request to a model
+    SYNTHETIC_GENERATE = "synthetic:generate"  # run an operator-configured synthetic source
     SSO_MANAGE = "sso:manage"           # configure the org's IdP connection
 
 
@@ -128,7 +129,7 @@ _VIEWER_PERMISSIONS = frozenset({
 # workspaces they can see; cannot manage people, keys, or money.
 _MEMBER_PERMISSIONS = _VIEWER_PERMISSIONS | {
     Permission.PROJECT_CREATE, Permission.PROJECT_UPDATE,
-    Permission.ROUTE_INVOKE, Permission.APIKEY_READ,
+    Permission.ROUTE_INVOKE, Permission.SYNTHETIC_GENERATE, Permission.APIKEY_READ,
 }
 
 # Admin: runs the org day to day. People, workspaces, projects, keys, audit.

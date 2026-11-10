@@ -94,7 +94,12 @@ from modelrouter.observability.replay import (
     ReplayStore,
 )
 from modelrouter.observability.async_publish import KafkaTracePublisher, SqsTracePublisher
-from modelrouter.operations import RecurringJob, RecurringJobRunner
+from modelrouter.operations import RecurringJobRunner, standard_worker_jobs
+from modelrouter.api.app_factory import create_app
+from modelrouter.api.control_plane import control_plane_router
+from modelrouter.api.data_plane import data_plane_router
+from modelrouter.api.health import health_router
+from modelrouter.api.observability import observability_router, serving_metrics_router
 
 _api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
 
@@ -336,6 +341,13 @@ async def lifespan(app: FastAPI):
     at request time — `app.state.sso is None` IS the off state, which means the
     off path has no code of its own to get wrong."""
     settings = Settings()
+    if os.environ.get("MODELROUTER_REQUIRE_MIGRATIONS", "false").lower() in {"1", "true", "yes"}:
+        from modelrouter.migrations import runner_from_environment
+
+        pending = runner_from_environment().pending()
+        if pending:
+            versions = ", ".join(migration.version for migration in pending)
+            raise RuntimeError(f"pending database migrations: {versions}; run `python -m modelrouter migrate`")
     skipped: list[str] = []
     adapters = settings.build_adapters(on_skip=lambda name, exc: skipped.append(name))
 
@@ -359,6 +371,7 @@ async def lifespan(app: FastAPI):
     app.state.traces = trace_service
     app.state.identity = identity_repo
     app.state.rate_limiter = _create_rate_limiter()
+    app.state.trace_publisher = trace_publisher
     app.state.audit = audit_log
     # Aggregation reads the trace log; it holds no state of its own, so there is
     # no second source of truth to keep in sync (see metrics.py).
@@ -372,16 +385,22 @@ async def lifespan(app: FastAPI):
     app.state.registry = registry
     credential_vault = create_credential_vault() if os.environ.get("MODELROUTER_BYOK_MASTER_KEY") else None
     health, prompt_cache, latency = _create_routing_state()
+    app.state.routing_health = health
     app.state.router = ModelRouter(
         adapters, accounting=accounting_service, price_lookup=registry.price_lookup(),
         max_output_tokens_lookup=registry.max_output_tokens_lookup(), traces=trace_service,
         credential_vault=credential_vault, health=health, prompt_cache=prompt_cache, latency=latency,
     )
     app.state.settings = settings
-    app.state.jobs = RecurringJobRunner([
-        RecurringJob("purge_replay", 3600, lambda: app.state.replay.purge_expired(before=datetime.now(timezone.utc))),
-    ])
-    await app.state.jobs.start()
+    # Recurring operations belong to the worker deployment. The unified app
+    # keeps them for local development; gateway/control replicas must never
+    # each run the same reconciliation or cleanup job independently.
+    app.state.jobs = None
+    if getattr(app.state, "deployment_mode", "unified") in {"unified", "worker"}:
+        app.state.jobs = RecurringJobRunner(standard_worker_jobs(
+            store=accounting_service.event_store, accounting=accounting_service, replay=app.state.replay,
+        ))
+        await app.state.jobs.start()
 
     # ── Optional: SSO. Absent unless configured; see the docstring above. ──
     app.state.sso = create_sso_service(identity_repo)
@@ -396,7 +415,8 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        await app.state.jobs.stop()
+        if app.state.jobs is not None:
+            await app.state.jobs.stop()
         # Shutdown, in reverse construction order. Each step is independently
         # guarded so one subsystem failing to close cannot skip the others —
         # otherwise a single bad close leaks everything after it.
@@ -428,14 +448,6 @@ async def _close_quietly(label: str, subject) -> None:
         print(f"[modelrouter.server] error closing {label}: {type(e).__name__}: {e}")
 
 
-app = FastAPI(
-    title="ModelRouter",
-    description="Multi-provider LLM gateway — chat, image, speech, transcription, all through one API.",
-    lifespan=lifespan,
-)
-
-
-@app.middleware("http")
 async def reject_oversized_requests(request: Request, call_next):
     content_length = request.headers.get("content-length")
     if content_length is None:
@@ -469,8 +481,10 @@ def _release_rate_limit(request: Request) -> None:
 # router's own dependencies reach back into `require_authz` above, and mounting
 # after `app` exists keeps that one-directional.
 from modelrouter.identity.http import router as _identity_router   # noqa: E402
+from modelrouter.tenancy.http import router as _tenancy_router     # noqa: E402
 
-app.include_router(_identity_router)
+control_plane_router.include_router(_identity_router)
+control_plane_router.include_router(_tenancy_router)
 
 # ── Optional: SSO. These two lines plus `identity/sso/` are the ENTIRE
 # footprint of the feature -- delete them and nothing else changes. Mounted
@@ -479,7 +493,7 @@ app.include_router(_identity_router)
 # so the routes answer 404 rather than half-working.
 from modelrouter.identity.sso.http import router as _sso_router   # noqa: E402
 
-app.include_router(_sso_router)
+control_plane_router.include_router(_sso_router)
 
 # ── Optional: synthetic data generation. Same two-line footprint as SSO —
 # delete `synthetic/` and these lines and nothing else changes. Its endpoints
@@ -487,7 +501,7 @@ app.include_router(_sso_router)
 # registers a source, so they answer 404 rather than half-working.
 from modelrouter.synthetic.http import router as _synthetic_router   # noqa: E402
 
-app.include_router(_synthetic_router)
+control_plane_router.include_router(_synthetic_router)
 
 
 def _metadata_dict(metadata: RouterMetadata) -> dict:
@@ -735,7 +749,7 @@ async def _stream_chat_response(
     return StreamingResponse(sse_body(), media_type="text/event-stream", headers=headers)
 
 
-@app.post("/v1/chat")
+@data_plane_router.post("/v1/chat")
 async def chat(
     body: ChatCompletionRequest, request: Request, http_response: Response,
     principal: Annotated[Principal, Depends(require_principal)],
@@ -834,7 +848,7 @@ class AutoChatRequest(BaseModel):
     cost_tier: Literal["low", "medium", "high"] | None = None
 
 
-@app.post("/v1/chat/auto")
+@data_plane_router.post("/v1/chat/auto")
 async def chat_auto(
     body: AutoChatRequest, request: Request, http_response: Response,
     principal: Annotated[Principal, Depends(require_principal)],
@@ -897,7 +911,7 @@ class FusionChatRequest(BaseModel):
     # docstring), an honest limitation, not silently ignored.
 
 
-@app.post("/v1/chat/fusion")
+@data_plane_router.post("/v1/chat/fusion")
 async def chat_fusion(
     body: FusionChatRequest, request: Request,
     principal: Annotated[Principal, Depends(require_principal)],
@@ -947,7 +961,7 @@ class BodyBuilderChatRequest(BaseModel):
     # only the pre-built-`plan` shape is exposed here.
 
 
-@app.post("/v1/chat/bodybuilder")
+@data_plane_router.post("/v1/chat/bodybuilder")
 async def chat_bodybuilder(
     body: BodyBuilderChatRequest, request: Request,
     principal: Annotated[Principal, Depends(require_principal)],
@@ -991,7 +1005,7 @@ class HedgeChatRequest(BaseModel):
     # same precedent Fusion/BodyBuilder already set for their own reasons.
 
 
-@app.post("/v1/chat/hedge")
+@data_plane_router.post("/v1/chat/hedge")
 async def chat_hedge(
     body: HedgeChatRequest, request: Request,
     principal: Annotated[Principal, Depends(require_principal)],
@@ -1189,7 +1203,7 @@ async def _stream_openai_compat_response(
     return StreamingResponse(sse_body(), media_type="text/event-stream", headers=headers)
 
 
-@app.post("/v1/chat/completions")
+@data_plane_router.post("/v1/chat/completions")
 async def chat_completions(
     body: OpenAIChatCompletionRequest, request: Request, http_response: Response,
     principal: Annotated[Principal, Depends(require_principal)],
@@ -1267,7 +1281,7 @@ async def chat_completions(
     }
 
 
-@app.post("/v1/responses")
+@data_plane_router.post("/v1/responses")
 async def responses(
     body: OpenAIResponsesRequest, request: Request, principal: Annotated[Principal, Depends(require_principal)],
 ):
@@ -1477,7 +1491,7 @@ async def _stream_anthropic_compat_response(
     return StreamingResponse(sse_body(), media_type="text/event-stream", headers=headers)
 
 
-@app.post("/v1/messages")
+@data_plane_router.post("/v1/messages")
 async def messages(
     body: AnthropicMessagesRequest, request: Request, http_response: Response,
     principal: Annotated[Principal, Depends(require_principal)],
@@ -1541,7 +1555,7 @@ async def messages(
     }
 
 
-@app.post("/v1/messages/count_tokens")
+@data_plane_router.post("/v1/messages/count_tokens")
 async def count_tokens(
     body: AnthropicCountTokensRequest, _principal: Annotated[Principal, Depends(require_principal)],
 ):
@@ -1556,7 +1570,7 @@ async def count_tokens(
 
 # ── Usage — the first real read-surface over L3's accounting ────────────
 
-@app.get("/v1/usage")
+@observability_router.get("/v1/usage")
 async def usage(principal: Annotated[Principal, Depends(require_principal)], request: Request):
     accounting: AccountingService = request.app.state.accounting
     account = accounting.balance(principal.tenant_id)
@@ -1588,7 +1602,7 @@ def _trace_dict(trace) -> dict:
     }
 
 
-@app.get("/v1/traces")
+@observability_router.get("/v1/traces")
 async def list_traces(
     principal: Annotated[Principal, Depends(require_principal)], request: Request, limit: int = 50,
 ):
@@ -1596,7 +1610,7 @@ async def list_traces(
     return {"data": [_trace_dict(t) for t in traces.list_traces(principal.tenant_id, limit=limit)]}
 
 
-@app.get("/v1/traces/{request_id}")
+@observability_router.get("/v1/traces/{request_id}")
 async def get_trace(
     request_id: str, principal: Annotated[Principal, Depends(require_principal)], request: Request,
 ):
@@ -1610,7 +1624,7 @@ async def get_trace(
 
 # ── Metrics — aggregation over the durable trace log ─────────────────────
 
-@app.get("/v1/metrics")
+@observability_router.get("/v1/metrics")
 async def tenant_metrics(
     principal: Annotated[Principal, Depends(require_principal)], request: Request,
     window_minutes: int | None = None,
@@ -1630,7 +1644,7 @@ async def tenant_metrics(
     return metrics.summarize(tenant_id=principal.tenant_id, since=since).as_dict()
 
 
-@app.get("/metrics")
+@serving_metrics_router.get("/metrics")
 async def prometheus_metrics(request: Request):
     """Prometheus exposition endpoint, spanning EVERY tenant.
 
@@ -1687,7 +1701,7 @@ class ReplayRequestBody(BaseModel):
     scorer: Literal["exact", "regex", "schema", "judge"] | None = None
 
 
-@app.post("/v1/compare")
+@observability_router.post("/v1/compare")
 async def compare_models(
     body: CompareRequestBody, request: Request,
     principal: Annotated[Principal, Depends(require_principal)],
@@ -1711,7 +1725,7 @@ async def compare_models(
     return result.as_dict()
 
 
-@app.post("/v1/replay/{request_id}")
+@observability_router.post("/v1/replay/{request_id}")
 async def replay_request(
     request_id: str, body: ReplayRequestBody, request: Request,
     principal: Annotated[Principal, Depends(require_principal)],
@@ -1752,7 +1766,7 @@ class ImageRequestBody(BaseModel):
     response_format: Literal["url", "b64_json"] = "url"
 
 
-@app.post("/v1/images", dependencies=[Depends(require_principal)])
+@data_plane_router.post("/v1/images", dependencies=[Depends(require_principal)])
 async def generate_image(body: ImageRequestBody, request: Request):
     router = _router(request)
     img_request = ImageGenerationRequest(
@@ -1782,7 +1796,7 @@ class SpeechRequestBody(BaseModel):
     response_format: Literal["mp3", "opus", "aac", "flac", "wav"] = "mp3"
 
 
-@app.post("/v1/speech", dependencies=[Depends(require_principal)])
+@data_plane_router.post("/v1/speech", dependencies=[Depends(require_principal)])
 async def speech(body: SpeechRequestBody, request: Request):
     from fastapi.responses import Response as RawResponse
 
@@ -1806,7 +1820,7 @@ async def speech(body: SpeechRequestBody, request: Request):
 
 # ── Transcription (speech-to-text) ────────────────────────────────────────
 
-@app.post("/v1/transcriptions", dependencies=[Depends(require_principal)])
+@data_plane_router.post("/v1/transcriptions", dependencies=[Depends(require_principal)])
 async def transcribe(
     request: Request,
     audio_file: Annotated[bytes, File(description="The audio file's raw bytes")],
@@ -1840,7 +1854,7 @@ async def transcribe(
 
 # ── Discovery / health — no auth required, nothing secret in either ──────
 
-@app.get("/v1/providers")
+@data_plane_router.get("/v1/providers")
 async def providers(request: Request):
     settings: Settings = request.app.state.settings
     return {
@@ -1849,7 +1863,7 @@ async def providers(request: Request):
     }
 
 
-@app.get("/v1/models")
+@data_plane_router.get("/v1/models")
 async def models(request: Request):
     """[BUILT — L2] The real model registry as a first-class product
     surface, per ARCHITECTURE-PLAN.md's "what OpenRouter has that we
@@ -1884,16 +1898,84 @@ async def models(request: Request):
     }
 
 
-@app.get("/live")
+@health_router.get("/live")
 async def live():
     return {"status": "ok"}
 
 
-@app.get("/health")
-@app.get("/ready")
+@health_router.get("/health")
+@health_router.get("/ready")
 async def health(request: Request):
     required_state = ("router", "tenancy_repo", "accounting", "traces", "identity")
     missing = [name for name in required_state if not hasattr(request.app.state, name)]
     if missing:
         raise HTTPException(status_code=503, detail={"status": "not_ready", "missing": missing})
-    return {"status": "ok"}
+    checks: dict[str, str] = {}
+    failures: dict[str, str] = {}
+    # Each check uses a benign read/PING, never writes data or consumes a
+    # rate-limit slot. Names are stable operational contracts; exception
+    # details are intentionally reduced to their type to avoid DSN/secret
+    # disclosure through a public probe response.
+    dependencies = {
+        "tenancy": lambda: request.app.state.tenancy_repo.list_tenants(),
+        "accounting": request.app.state.accounting.healthcheck,
+        "traces": request.app.state.traces.healthcheck,
+    }
+    limiter = getattr(request.app.state, "rate_limiter", None)
+    if limiter is not None:
+        dependencies["rate_limits"] = limiter.healthcheck
+    routing_health = getattr(request.app.state, "routing_health", None)
+    if routing_health is not None:
+        dependencies["routing_state"] = routing_health.healthcheck
+    for name, check in dependencies.items():
+        try:
+            check()
+            checks[name] = "ok"
+        except Exception as exc:
+            failures[name] = type(exc).__name__
+    publisher = getattr(request.app.state, "trace_publisher", None)
+    if publisher is not None:
+        stats = publisher.stats()
+        checks["trace_publisher"] = "degraded" if stats.last_error else "ok"
+    if failures:
+        raise HTTPException(status_code=503, detail={"status": "not_ready", "checks": checks, "failed": failures})
+    return {"status": "ok", "checks": checks}
+
+
+def _create_deployment_app(mode: Literal["unified", "gateway", "control-plane", "worker"]) -> FastAPI:
+    """Build one explicit ModelRouter deployment surface.
+
+    The handler functions above register with a named plane router instead of
+    the application.  The factory is therefore the single auditable place
+    that decides which plane can expose a route.
+    """
+    return create_app(
+        mode,
+        lifespan=lifespan,
+        data_plane_router=data_plane_router,
+        control_plane_router=control_plane_router,
+        observability_router=observability_router,
+        serving_metrics_router=serving_metrics_router,
+        health_router=health_router,
+        http_middleware=reject_oversized_requests,
+    )
+
+
+def create_gateway_app() -> FastAPI:
+    """Public request-serving deployment: data plane, metrics, and health."""
+    return _create_deployment_app("gateway")
+
+
+def create_control_plane_app() -> FastAPI:
+    """Private administrative deployment: management, observability, and health."""
+    return _create_deployment_app("control-plane")
+
+
+def create_worker_app() -> FastAPI:
+    """Recurring-operation deployment with lifecycle probes but no API surface."""
+    return _create_deployment_app("worker")
+
+
+# Backwards-compatible default import and ``uvicorn modelrouter.server:app``
+# entrypoint. Local development retains the complete single-process surface.
+app = _create_deployment_app("unified")

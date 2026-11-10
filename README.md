@@ -331,6 +331,23 @@ cp .env.example .env
 
 ### Production deployment
 
+Build the supplied non-root gateway image after running migrations as a
+separate deployment step. It defaults to `MODELROUTER_REQUIRE_MIGRATIONS=true`
+and checks `/ready`, so an unmigrated or unready gateway is never advertised
+as healthy. Orchestrators can replace the command with the control-plane or
+worker ASGI entrypoint; do not run all three roles from one production image
+instance.
+
+```bash
+docker build -t modelrouter:local .
+docker run --rm -p 8000:8000 --env-file .env modelrouter:local
+```
+
+The checked-in GitHub workflow runs tests, compilation, dependency auditing,
+secret scanning, and SBOM generation on every pull request and `main` push.
+The prioritized implementation checklist and acceptance criteria live in
+[`PRODUCTION_BACKLOG.md`](PRODUCTION_BACKLOG.md).
+
 The storage tier above is Law 1 in practice: **zero-infra by default, an
 opt-in upgrade, never a rewrite** — the same `ModelRouter`/`AccountingService`/
 `TraceService` code runs unchanged against any of the four backends.
@@ -358,8 +375,15 @@ is exercisable on a laptop with no cloud account:
 docker compose up -d
 pip install -e ".[all]"
 MODELROUTER_STORAGE=postgres MODELROUTER_POSTGRES_DSN=postgresql://modelrouter:modelrouter@localhost:5432/modelrouter \
-  python -m modelrouter serve
+  python -m modelrouter migrate
+MODELROUTER_STORAGE=postgres MODELROUTER_POSTGRES_DSN=postgresql://modelrouter:modelrouter@localhost:5432/modelrouter \
+  MODELROUTER_REQUIRE_MIGRATIONS=true python -m modelrouter serve
 ```
+
+Use `python -m modelrouter migrate --check` as a CI or pre-deploy gate. In
+production, run migrations as a one-off deployment job, then set
+`MODELROUTER_REQUIRE_MIGRATIONS=true` on gateway, control-plane, and worker
+tasks so an out-of-date schema fails readiness instead of serving traffic.
 
 `infra/terraform/` maps every one of those local containers to its real AWS
 equivalent (ElastiCache, Aurora Serverless v2, MSK, KMS, SQS) plus an ECS
@@ -372,6 +396,43 @@ been run at that scale.
 ```bash
 python -m modelrouter serve --port 8000
 ```
+
+### Deploy explicit API planes
+
+The default command above remains a backwards-compatible **unified** app for
+local development. Production deployments can run isolated ASGI entrypoints;
+route ownership is explicit in `modelrouter.api`, not inferred from a mutable
+path allowlist.
+
+```bash
+# Public gateway: model calls, model discovery, Prometheus metrics, health
+uvicorn modelrouter.api.gateway:app --host 0.0.0.0 --port 8000
+
+# Private control plane: identity, SSO, workspace/project administration,
+# tenant traces, usage, comparison, replay, and health
+uvicorn modelrouter.api.control_plane_app:app --host 0.0.0.0 --port 8001
+
+# Worker: recurring cleanup/reconciliation lifecycle plus probe endpoints only
+uvicorn modelrouter.api.worker:app --host 0.0.0.0 --port 8002
+```
+
+The worker records every run in the durable event store (`worker_jobs`). Its
+default jobs reconcile Redis reservation counters from durable accounting
+events every five minutes and purge expired replay captures hourly. A failed
+run is recorded, surfaced in scheduler status, and retried on its next
+scheduled interval; it does not stop the worker loop. Catalog refresh and
+provider probing are deliberately injected deployment hooks, so no worker
+silently calls an unapproved external source or provider account.
+
+The gateway still initializes identity and tenancy services because every model
+call must authenticate, authorize, rate-limit, reserve budget, and trace work.
+It does not expose their management endpoints. Keep the control plane private
+behind an internal load balancer or administrative network policy.
+
+[`modelrouter.api.allowlist`](src/modelrouter/api/allowlist.py) is the concise
+deployment-review manifest for these public surfaces. It documents the route
+families expected on each plane; explicit router composition remains the runtime
+enforcement mechanism.
 
 On first run against an empty tenant store, a tenant and a funded API key are
 created automatically — the key is printed once, at startup, and is never
@@ -498,7 +559,10 @@ Honestly-scoped gaps in what's already built, named rather than implied:
 - **The prompt-cache warm map is in-memory**, so with several replicas each one
   learns warmth independently. Correct on a single replica, merely suboptimal
   across many (it never routes *wrongly* — it just misses a cache it can't see).
-- **The closed-loop scorer has no scheduler.** `ClosedLoopService` is real and
-  tested but nothing runs it periodically; that worker is not built.
+- **Scheduled closed-loop evaluations and evidence/export retries are not
+  built yet.** The worker now durably records reconciliation and replay
+  retention jobs, with explicit hooks for catalog refresh and provider probes;
+  a durable evaluation/outbox queue is still required before those delivery
+  workflows can be claimed.
 
 Full detail on each: [the identity package README](src/modelrouter/identity/README.md).

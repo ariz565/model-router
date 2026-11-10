@@ -65,5 +65,11 @@ class RedisRateLimiter:
         with redis_errors("rate_limit_release"):
             self._client.decr(self._key(scope, identifier, "concurrent"))
 
+    def healthcheck(self) -> None:
+        """Verify the shared limiter backend without consuming any quota."""
+        with redis_errors("rate_limit_healthcheck"):
+            if not self._client.ping():
+                raise RuntimeError("Redis rate-limit backend did not respond to PING")
+
     def _key(self, scope: str, identifier: str, metric: str) -> str:
         return f"{self._prefix}:{scope}:{identifier}:{metric}"

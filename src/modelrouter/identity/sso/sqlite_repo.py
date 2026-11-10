@@ -33,6 +33,7 @@ from modelrouter.identity.sso.models import (
     SsoConnection,
 )
 from modelrouter.store.db import SqliteDatabase
+from modelrouter.migrations.runtime import schema_bootstrap_allowed
 
 _SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 
@@ -57,7 +58,8 @@ class SqliteSsoRepo:
 
         self._db = db
         self._fernet = Fernet(fernet_key or resolve_local_key())
-        self._db.executescript(_SCHEMA_PATH.read_text())
+        if schema_bootstrap_allowed():
+            self._db.executescript(_SCHEMA_PATH.read_text())
 
     # ── Connections ───────────────────────────────────────────────────────
 

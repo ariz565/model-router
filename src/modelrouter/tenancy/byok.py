@@ -47,6 +47,7 @@ from typing import Protocol, runtime_checkable
 
 from modelrouter.core.errors import ConfigError
 from modelrouter.store.postgres_events import create_postgres_pool, postgres_errors
+from modelrouter.migrations.runtime import schema_bootstrap_allowed
 
 
 @runtime_checkable
@@ -172,13 +173,14 @@ class SqliteCredentialVault:
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")
-        with self._lock:
-            self._conn.execute(
-                "CREATE TABLE IF NOT EXISTS byok_credentials ("
-                " tenant_id TEXT NOT NULL, provider TEXT NOT NULL, ciphertext BLOB NOT NULL,"
-                " PRIMARY KEY (tenant_id, provider))"
-            )
-            self._conn.commit()
+        if schema_bootstrap_allowed():
+            with self._lock:
+                self._conn.execute(
+                    "CREATE TABLE IF NOT EXISTS byok_credentials ("
+                    " tenant_id TEXT NOT NULL, provider TEXT NOT NULL, ciphertext BLOB NOT NULL,"
+                    " PRIMARY KEY (tenant_id, provider))"
+                )
+                self._conn.commit()
 
     def store_key(self, tenant_id: str, provider: str, api_key: str) -> None:
         _validate_identifiers(tenant_id, provider)
@@ -215,13 +217,14 @@ class PostgresCredentialVault:
 
         self._fernet = Fernet(fernet_key)
         self._pool = create_postgres_pool(dsn)
-        with postgres_errors("byok_schema_bootstrap"):
-            with self._pool.connection() as conn:
-                conn.execute(
-                    "CREATE TABLE IF NOT EXISTS byok_credentials (tenant_id TEXT NOT NULL, provider TEXT NOT NULL, "
-                    "ciphertext BYTEA NOT NULL, PRIMARY KEY (tenant_id, provider))"
-                )
-                conn.commit()
+        if schema_bootstrap_allowed():
+            with postgres_errors("byok_schema_bootstrap"):
+                with self._pool.connection() as conn:
+                    conn.execute(
+                        "CREATE TABLE IF NOT EXISTS byok_credentials (tenant_id TEXT NOT NULL, provider TEXT NOT NULL, "
+                        "ciphertext BYTEA NOT NULL, PRIMARY KEY (tenant_id, provider))"
+                    )
+                    conn.commit()
 
     def store_key(self, tenant_id: str, provider: str, api_key: str) -> None:
         _validate_identifiers(tenant_id, provider)

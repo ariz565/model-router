@@ -363,6 +363,26 @@ def _run_providers(_args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_migrate(args: argparse.Namespace) -> int:
+    """Apply, or CI-check, versioned relational schema migrations."""
+    from modelrouter.migrations import runner_from_environment
+
+    runner = runner_from_environment()
+    pending = runner.pending()
+    if args.check:
+        if pending:
+            print("Pending migrations: " + ", ".join(f"{migration.version}:{migration.name}" for migration in pending))
+            return 1
+        print("Schema is up to date.")
+        return 0
+    applied = runner.migrate()
+    if applied:
+        print("Applied migrations: " + ", ".join(applied))
+    else:
+        print("Schema is already up to date.")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     _ensure_utf8_streams()
 
@@ -398,6 +418,9 @@ def main(argv: list[str] | None = None) -> int:
     _add_common_args(transcribe)
 
     sub.add_parser("providers", help="List provider API-key configuration status")
+
+    migrate = sub.add_parser("migrate", help="Apply versioned SQLite/Postgres schema migrations")
+    migrate.add_argument("--check", action="store_true", help="Exit non-zero when migrations are pending (CI/deploy gate)")
 
     serve = sub.add_parser("serve", help="Run the HTTP server (needs the `server` extra)")
     serve.add_argument("--host", default="127.0.0.1")
@@ -446,6 +469,8 @@ def main(argv: list[str] | None = None) -> int:
             return asyncio.run(_run_transcribe(args))
         if args.command == "providers":
             return _run_providers(args)
+        if args.command == "migrate":
+            return _run_migrate(args)
         if args.command == "serve":
             return _run_serve(args)
         if args.command == "tenants":

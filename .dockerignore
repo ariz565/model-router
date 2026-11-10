@@ -1,0 +1,16 @@
+.git
+.github
+.pytest_cache
+__pycache__
+*.py[cod]
+*.db
+.env
+.venv
+build
+dist
+docs
+tests
+infra
+litellm-architecture..md
+modelrouter-architecture.md
+LLM.md

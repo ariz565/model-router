@@ -54,6 +54,7 @@ from modelrouter.identity.models import (
     WorkspaceMembership,
 )
 from modelrouter.store.db import SqliteDatabase
+from modelrouter.migrations.runtime import schema_bootstrap_allowed
 
 _SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 
@@ -77,7 +78,8 @@ def _normalize_email(email: str) -> str:
 class SqliteIdentityRepo:
     def __init__(self, db: SqliteDatabase):
         self._db = db
-        self._db.executescript(_SCHEMA_PATH.read_text())
+        if schema_bootstrap_allowed():
+            self._db.executescript(_SCHEMA_PATH.read_text())
 
     # ── Users ─────────────────────────────────────────────────────────────
 
@@ -575,7 +577,8 @@ class SqliteAuditLog:
 
     def __init__(self, db: SqliteDatabase):
         self._db = db
-        self._db.executescript(_SCHEMA_PATH.read_text())
+        if schema_bootstrap_allowed():
+            self._db.executescript(_SCHEMA_PATH.read_text())
 
     def append(self, record: AuditRecord) -> AuditRecord:
         from dataclasses import replace

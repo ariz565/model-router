@@ -1,3 +1,4 @@
-from modelrouter.operations.scheduler import RecurringJob, RecurringJobRunner
+from modelrouter.operations.jobs import DurableJob, standard_worker_jobs
+from modelrouter.operations.scheduler import JobStatus, RecurringJob, RecurringJobRunner
 
-__all__ = ["RecurringJob", "RecurringJobRunner"]
+__all__ = ["DurableJob", "JobStatus", "RecurringJob", "RecurringJobRunner", "standard_worker_jobs"]

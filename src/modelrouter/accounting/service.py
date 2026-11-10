@@ -80,6 +80,11 @@ class AccountingService:
         self._lock = threading.Lock()
         self._fast_ledger = fast_ledger
 
+    @property
+    def event_store(self) -> EventStore:
+        """The durable accounting source of truth, for worker reconciliation."""
+        return self._store
+
     # ── Public API ────────────────────────────────────────────────────────
 
     def purchase_credits(
@@ -186,6 +191,40 @@ class AccountingService:
             })
             if self._fast_ledger is not None:
                 self._fast_ledger.release(tenant_id, reserved_micro)
+
+    def reconcile_fast_ledger(self) -> dict[str, int]:
+        """Repair Redis budget projections from the append-only event log.
+
+        Returns counters useful to the worker's durable run record.  The
+        method is a no-op when the deployment deliberately uses the
+        single-process/event-log path (``fast_ledger is None``).
+        """
+        if self._fast_ledger is None:
+            return {"tenants": 0, "expired_reservations": 0}
+        with self._lock:
+            tenant_ids = {
+                event.data["tenant_id"]
+                for event in self._store.read_after(0, stream=ACCOUNTING_STREAM)
+                if event.data.get("tenant_id")
+            }
+            expired_before = sum(len(self._open_reservations(tenant_id)) for tenant_id in tenant_ids)
+            for tenant_id in tenant_ids:
+                self._expire_stale_reservations(tenant_id)
+                account = self._project(tenant_id)
+                self._fast_ledger.replace_balance(
+                    tenant_id,
+                    purchased_micro_usd=account.purchased_micro_usd,
+                    spent_micro_usd=account.spent_micro_usd,
+                    reserved_micro_usd=account.reserved_micro_usd,
+                )
+            expired_after = sum(len(self._open_reservations(tenant_id)) for tenant_id in tenant_ids)
+        return {"tenants": len(tenant_ids), "expired_reservations": expired_before - expired_after}
+
+    def healthcheck(self) -> None:
+        """Exercise durable accounting storage and, when configured, Redis."""
+        self._store.last_seq(stream=ACCOUNTING_STREAM)
+        if self._fast_ledger is not None:
+            self._fast_ledger.healthcheck()
 
     # ── Projection (replay-based; see module docstring) ──────────────────
 

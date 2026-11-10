@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 from modelrouter.core.errors import TenantNotFoundError
 from modelrouter.store.postgres_events import postgres_errors
+from modelrouter.migrations.runtime import schema_bootstrap_allowed
 from modelrouter.tenancy.keys import display_prefix, generate_plaintext_key, hash_api_key
 from modelrouter.tenancy.models import ApiKey, Tenant
 
@@ -19,10 +20,11 @@ _SCHEMA_PATH = Path(__file__).with_name("schema_postgres.sql")
 class PostgresTenancyRepo:
     def __init__(self, pool: "ConnectionPool"):
         self._pool = pool
-        with postgres_errors("tenancy_schema_bootstrap"):
-            with self._pool.connection() as conn:
-                conn.execute(_SCHEMA_PATH.read_text())
-                conn.commit()
+        if schema_bootstrap_allowed():
+            with postgres_errors("tenancy_schema_bootstrap"):
+                with self._pool.connection() as conn:
+                    conn.execute(_SCHEMA_PATH.read_text())
+                    conn.commit()
 
     def create_tenant(
         self, name: str, *, parent_account_id: str | None = None, token_ceiling: int | None = None,

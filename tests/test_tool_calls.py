@@ -11,10 +11,12 @@ covered by test_server_tools_real.py).
 """
 
 import json
+from datetime import datetime, timezone
 
 import pytest
 
 from modelrouter.providers.adapters import FakeProviderAdapter
+from modelrouter.registry import ModelEntry, ModelRegistry, Pricing, ProviderRoute
 
 fastapi_testclient = pytest.importorskip("fastapi.testclient")
 TestClient = fastapi_testclient.TestClient
@@ -76,6 +78,22 @@ def _client_with_tool_calling_fake(*, tool_calls=None, response_text: str = "fak
     client.__enter__()
     fake = RecordingAdapter("fake", tool_calls=tool_calls, response_text=response_text)
     server_module.app.state.router = ModelRouter({"fake": fake})
+    pricing = (Pricing(
+        prompt_per_1m=0.0, completion_per_1m=0.0,
+        effective_from=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    ),)
+    server_module.app.state.registry = ModelRegistry([
+        ModelEntry(
+            model_id="fake/model-a", display_name="Test Model", family="test",
+            released="2026-01-01", provider_routes=(ProviderRoute("fake", "model-a"),),
+            pricing_history=pricing, capabilities=frozenset({"chat", "tools", "streaming"}),
+        ),
+        ModelEntry(
+            model_id="fake/claude-opus-4-5", display_name="Test Claude", family="test",
+            released="2026-01-01", provider_routes=(ProviderRoute("fake", "claude-opus-4-5"),),
+            pricing_history=pricing, capabilities=frozenset({"chat", "tools", "streaming"}),
+        ),
+    ])
     _tenant, plaintext_key = _issue_key(server_module)
     return client, fake, plaintext_key
 

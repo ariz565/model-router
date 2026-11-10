@@ -11,13 +11,12 @@ auth paths, each with its own tenant plumbing) is where cross-tenant bugs
 breed.
 
 **Machine keys get `member`-equivalent permissions, and that is a deliberate,
-documented scope.** An API key can invoke models and read its own tenant's
-usage/traces — precisely what the existing HTTP surface already allowed a
-valid key to do, so this introduces no behavior change there — and it can do
-nothing administrative: it cannot invite people, change roles, rotate keys, or
-touch billing. Per-key scopes (a key restricted to one project, or to
-read-only) are real, useful, and NOT built here; when they arrive they become a
-field on `ApiKey` that narrows this set, never widens it.
+documented scope.** An API key can invoke models, run operator-configured
+synthetic generation, and read its own tenant's usage/traces. It can do nothing
+administrative: it cannot register data sources, invite people, change roles,
+rotate keys, or touch billing. Per-key scopes (a key restricted to one project,
+or to read-only) are real, useful, and NOT built here; when they arrive they
+become a field on `ApiKey` that narrows this set, never widens it.
 
 **Tenant identity comes from the credential, never from the request.** The
 `tenant_id` on a `Principal` is whatever the API key or session row says it

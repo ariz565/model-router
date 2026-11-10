@@ -20,6 +20,13 @@ class _FakeRedisClient:
         self._kv: dict[str, int] = {}
 
     def register_script(self, _lua_source: str):
+        if "redis.call('SET'" in _lua_source:
+            def _replace_balance(keys, args):
+                for key, amount in zip(keys, args, strict=True):
+                    self._kv[key] = int(amount)
+                return 1
+            return _replace_balance
+
         def _try_reserve(keys, args):
             purchased_key, spent_key, reserved_key = keys
             amount = int(args[0])
@@ -161,3 +168,18 @@ def test_fast_ledger_stays_in_sync_across_multiple_tenants_independently():
     # tn_b's budget must be completely unaffected by tn_a's reservation.
     reservation_b = service.reserve("tn_b", "req_b", 5.0)
     assert reservation_b.amount_usd == 5.0
+
+
+def test_reconciliation_repairs_redis_counters_from_the_event_log():
+    ledger = _ledger()
+    service = AccountingService(InMemoryEventStore(), fast_ledger=ledger)
+    service.purchase_credits("tn_a", 10.0)
+    service.reserve("tn_a", "req1", 4.0)
+    # Simulate the documented crash-window leak: Redis now has a bogus hold.
+    ledger._client.incrby(ledger._key("tn_a", "reserved"), 6_000_000)  # type: ignore[attr-defined]
+    assert ledger.try_reserve("tn_a", 1) is False
+
+    result = service.reconcile_fast_ledger()
+
+    assert result == {"tenants": 1, "expired_reservations": 0}
+    assert ledger.try_reserve("tn_a", 6_000_000) is True

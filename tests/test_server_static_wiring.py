@@ -112,6 +112,8 @@ def test_no_route_is_left_completely_unauthenticated_by_accident(tree):
     conscious edit to this test rather than an omission nobody notices."""
     public_paths = {
         "/health",
+        "/live",
+        "/ready",
         "/v1/models",
         "/v1/providers",
         "/v1/orgs",                     # registration: no credential can exist yet

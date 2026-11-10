@@ -31,6 +31,11 @@ class RedisHealthTracker:
     def sort_by_health(self, candidates: list[str]) -> list[str]:
         return sorted(candidates, key=self.is_unhealthy)
 
+    def healthcheck(self) -> None:
+        with redis_errors("routing_state_healthcheck"):
+            if not self._client.ping():
+                raise RuntimeError("Redis routing-state backend did not respond to PING")
+
     def _key(self, provider_name: str) -> str:
         return f"{self._prefix}:{provider_name}"
 

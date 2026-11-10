@@ -100,6 +100,18 @@ class ReservationLedger(Protocol):
         transient (harmless) under-count of `spent`, never a double-count."""
         ...
 
+    def replace_balance(
+        self, tenant_id: str, *, purchased_micro_usd: int, spent_micro_usd: int,
+        reserved_micro_usd: int,
+    ) -> None:
+        """Replace this tenant's materialized counters from the durable log.
+
+        This is deliberately a worker-only repair operation, never part of a
+        request.  It closes the crash window between a Redis mutation and the
+        corresponding event-log append without making Redis authoritative.
+        """
+        ...
+
 
 _TRY_RESERVE_SCRIPT = """
 local purchased = tonumber(redis.call('GET', KEYS[1]) or '0')
@@ -111,6 +123,13 @@ if (purchased - spent - reserved) >= amount then
     return 1
 end
 return 0
+"""
+
+_REPLACE_BALANCE_SCRIPT = """
+redis.call('SET', KEYS[1], ARGV[1])
+redis.call('SET', KEYS[2], ARGV[2])
+redis.call('SET', KEYS[3], ARGV[3])
+return 1
 """
 
 
@@ -137,6 +156,7 @@ class RedisReservationLedger:
         self._client = client
         self._prefix = key_prefix
         self._try_reserve_script = client.register_script(_TRY_RESERVE_SCRIPT)
+        self._replace_balance_script = client.register_script(_REPLACE_BALANCE_SCRIPT)
 
     def sync_purchase(self, tenant_id: str, amount_micro_usd: int) -> None:
         self._require_non_negative(amount_micro_usd)
@@ -162,6 +182,24 @@ class RedisReservationLedger:
         self._require_non_negative(amount_micro_usd)
         with redis_errors("record_spend"):
             self._client.incrby(self._key(tenant_id, "spent"), amount_micro_usd)
+
+    def replace_balance(
+        self, tenant_id: str, *, purchased_micro_usd: int, spent_micro_usd: int,
+        reserved_micro_usd: int,
+    ) -> None:
+        for amount in (purchased_micro_usd, spent_micro_usd, reserved_micro_usd):
+            self._require_non_negative(amount)
+        with redis_errors("replace_balance"):
+            self._replace_balance_script(
+                keys=[self._key(tenant_id, "purchased"), self._key(tenant_id, "spent"),
+                      self._key(tenant_id, "reserved")],
+                args=[purchased_micro_usd, spent_micro_usd, reserved_micro_usd],
+            )
+
+    def healthcheck(self) -> None:
+        with redis_errors("reservation_ledger_healthcheck"):
+            if not self._client.ping():
+                raise RuntimeError("Redis reservation-ledger backend did not respond to PING")
 
     def _key(self, tenant_id: str, field: str) -> str:
         if not tenant_id:

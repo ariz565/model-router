@@ -15,6 +15,7 @@ from pathlib import Path
 
 from modelrouter.core.errors import TenantNotFoundError
 from modelrouter.store.db import SqliteDatabase
+from modelrouter.migrations.runtime import schema_bootstrap_allowed
 from modelrouter.tenancy.keys import display_prefix, generate_plaintext_key, hash_api_key
 from modelrouter.tenancy.models import ApiKey, Tenant
 
@@ -24,7 +25,8 @@ _SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 class SqliteTenancyRepo:
     def __init__(self, db: SqliteDatabase):
         self._db = db
-        self._db.executescript(_SCHEMA_PATH.read_text())
+        if schema_bootstrap_allowed():
+            self._db.executescript(_SCHEMA_PATH.read_text())
 
     def create_tenant(
         self, name: str, *, parent_account_id: str | None = None, token_ceiling: int | None = None,

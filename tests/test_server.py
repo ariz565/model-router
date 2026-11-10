@@ -77,7 +77,9 @@ def test_health_endpoint_needs_no_auth():
     with TestClient(server_module.app) as client:
         response = client.get("/health")
         assert response.status_code == 200
-        assert response.json() == {"status": "ok"}
+        body = response.json()
+        assert body["status"] == "ok"
+        assert body["checks"] == {"tenancy": "ok", "accounting": "ok", "traces": "ok"}
 
 
 def test_providers_endpoint_lists_known_providers():
@@ -695,14 +697,14 @@ def test_openai_compat_json_schema_contract_is_enforced():
     from modelrouter.router import ModelRouter
 
     with TestClient(server_module.app) as client:
-        fake = FakeProviderAdapter("fake", response_text='{"age": 5}')   # missing required "name"
-        server_module.app.state.router = ModelRouter({"fake": fake})
+        fake = FakeProviderAdapter("openai", response_text='{"age": 5}')   # missing required "name"
+        server_module.app.state.router = ModelRouter({"openai": fake})
         _tenant, key = _issue_key(server_module)
 
         response = client.post(
             "/v1/chat/completions",
             json={
-                "model": "model-a", "messages": [{"role": "user", "content": "hi"}],
+                "model": "gpt-5.4-nano", "messages": [{"role": "user", "content": "hi"}],
                 "response_format": {
                     "type": "json_schema",
                     "json_schema": {

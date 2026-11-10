@@ -38,7 +38,8 @@ from modelrouter.core.errors import (
     SlugConflictError,
     WorkspaceNotFoundError,
 )
-from modelrouter.identity.authz import AuthzContext, Principal
+from modelrouter.identity.authz import AuthzContext
+from modelrouter.identity.sso.sessions import SESSION_COOKIE_NAME
 from modelrouter.identity.roles import (
     ROLE_ADMIN,
     ROLE_MEMBER,
@@ -336,19 +337,17 @@ async def accept_invitation(body: AcceptInviteRequest, request: Request):
     prove an email address, so invitation acceptance is unavailable. That's a
     real, documented limitation rather than a hole — the alternative would be
     trusting a self-asserted address."""
-    from modelrouter.server import require_principal
-
-    principal: Principal = await require_principal(
-        request.headers.get("Authorization"), request,
-    )
-    if not principal.is_human:
+    if request.headers.get("Authorization") is not None:
         raise HTTPException(
             status_code=403,
             detail="accepting an invitation requires a signed-in user session, not an API key",
         )
-    user = _repo(request).get_user(principal.subject_id)
-    if user is None:
-        raise HTTPException(status_code=403, detail="no user record for this session")
+    sso = getattr(request.app.state, "sso", None)
+    token = request.cookies.get(SESSION_COOKIE_NAME)
+    authenticated = sso.authenticate_identity(token) if sso is not None and token else None
+    if authenticated is None:
+        raise HTTPException(status_code=401, detail="missing or invalid credentials")
+    _session, user = authenticated
 
     try:
         accepted_user, tenant_id = _service(request).accept_invitation(

@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from modelrouter.store.db import SqliteDatabase
+from modelrouter.migrations.runtime import schema_bootstrap_allowed
 from modelrouter.store.events import Event
 
 _SCHEMA_PATH = Path(__file__).with_name("schema.sql")
@@ -18,7 +19,8 @@ _SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 class SqliteEventStore:
     def __init__(self, db: SqliteDatabase):
         self._db = db
-        self._db.executescript(_SCHEMA_PATH.read_text())
+        if schema_bootstrap_allowed():
+            self._db.executescript(_SCHEMA_PATH.read_text())
 
     def append(self, stream: str, event_type: str, data: dict) -> Event:
         at = datetime.now(timezone.utc)

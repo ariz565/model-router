@@ -272,6 +272,36 @@ class SsoService:
         )
         return session, session_principal(session, membership.role)
 
+    def authenticate_identity(self, session_token: str) -> tuple[Session, User] | None:
+        """Authenticate the person without requiring membership in a tenant.
+
+        This deliberately narrow operation exists for invitation acceptance:
+        the invitation token authorizes joining its tenant, so requiring an
+        existing membership first would make the operation impossible. It
+        still verifies the opaque session token, both expiries, revocation,
+        and the active user record. Callers must not use it for tenant data.
+        """
+        session = self._sso.get_session_by_token_hash(
+            sessions_module.hash_session_token(session_token),
+        )
+        if session is None:
+            return None
+        now = self._now()
+        if not session.is_valid_at(now):
+            return None
+        user = self._identity.get_user(session.user_id)
+        if user is None or not user.is_active:
+            self._sso.revoke_session(session.session_id)
+            return None
+        self._sso.touch_session(
+            session.session_id,
+            idle_expires_at=sessions_module.refreshed_idle_expiry(
+                now, idle_timeout_minutes=self._idle_minutes,
+            ),
+            last_seen_at=now,
+        )
+        return session, user
+
     # ── Logout and org switching ──────────────────────────────────────────
 
     def logout(self, session_token: str) -> None:
